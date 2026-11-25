@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -12,6 +12,8 @@ class TFIndicators:
     atr14: float
     rsi14: float
     poc80: float
+    val80: float
+    vah80: float
     swing_low_20: float
     swing_high_20: float
     close: float
@@ -40,7 +42,6 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr3 = (low - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    # Первое значение можно заполнить high - low
     tr.iloc[0] = tr1.iloc[0]
     atr = calculate_wilder_rma(tr, period=period)
     return atr
@@ -57,33 +58,33 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     avg_gain = calculate_wilder_rma(gain, period=period)
     avg_loss = calculate_wilder_rma(loss, period=period)
 
-    # Предотвращение деления на ноль
     rs = np.where(avg_loss == 0, 100.0, avg_gain / avg_loss)
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    # Если avg_loss == 0 и avg_gain == 0 -> 50, если avg_loss == 0 и avg_gain > 0 -> 100
     rsi = np.where((avg_loss == 0) & (avg_gain == 0), 50.0, rsi)
     return pd.Series(rsi, index=df.index)
 
 
-def calculate_vpvr_poc(df: pd.DataFrame, lookback: int = 80, num_bins: int = 60) -> float:
+def calculate_vpvr(
+    df: pd.DataFrame, lookback: int = 80, num_bins: int = 60, va_pct: float = 0.70
+) -> Tuple[float, float, float]:
     """
-    Расчёт POC (Point of Control) — уровень с максимальным проторгованным
-    объёмом в профиле VPVR за последние lookback свечей, разбив диапазон
-    [min_low, max_high] на num_bins корзин.
+    Расчёт VPVR профиля за последние lookback свечей:
+    - POC (Point of Control) — корзина с максимальным объёмом.
+    - VAL (Value Area Low) — нижняя граница 70% проторгованного объёма.
+    - VAH (Value Area High) — верхняя граница 70% проторгованного объёма.
     """
     subset = df.iloc[-lookback:].copy()
     if subset.empty:
-        return 0.0
+        return 0.0, 0.0, 0.0
 
     min_low = float(subset["low"].min())
     max_high = float(subset["high"].max())
 
     if max_high <= min_low:
-        return min_low
+        return min_low, min_low, max_high
 
     bin_width = (max_high - min_low) / num_bins
     bin_volumes = np.zeros(num_bins, dtype=np.float64)
-
     bin_edges = [min_low + i * bin_width for i in range(num_bins + 1)]
 
     for _, row in subset.iterrows():
@@ -95,7 +96,6 @@ def calculate_vpvr_poc(df: pd.DataFrame, lookback: int = 80, num_bins: int = 60)
             continue
 
         if c_high <= c_low:
-            # Свеча с нулевым диапазоном — определяем корзину
             idx = int((c_low - min_low) / bin_width)
             idx = min(max(0, idx), num_bins - 1)
             bin_volumes[idx] += c_vol
@@ -103,12 +103,10 @@ def calculate_vpvr_poc(df: pd.DataFrame, lookback: int = 80, num_bins: int = 60)
 
         c_range = c_high - c_low
 
-        # Распределяем объём свечи по перекрывающимся корзинам
         for b in range(num_bins):
             b_left = bin_edges[b]
             b_right = bin_edges[b + 1]
 
-            # Пересечение диапазона свечи [c_low, c_high] и корзины [b_left, b_right]
             overlap_left = max(c_low, b_left)
             overlap_right = min(c_high, b_right)
 
@@ -116,10 +114,44 @@ def calculate_vpvr_poc(df: pd.DataFrame, lookback: int = 80, num_bins: int = 60)
                 overlap_fraction = (overlap_right - overlap_left) / c_range
                 bin_volumes[b] += c_vol * overlap_fraction
 
-    # Находим корзину с максимальным объёмом
-    max_bin_idx = int(np.argmax(bin_volumes))
-    poc_level = min_low + (max_bin_idx + 0.5) * bin_width
-    return float(poc_level)
+    total_vol = float(np.sum(bin_volumes))
+    if total_vol <= 0:
+        mid = 0.5 * (min_low + max_high)
+        return mid, min_low, max_high
+
+    # POC
+    poc_idx = int(np.argmax(bin_volumes))
+    poc_level = min_low + (poc_idx + 0.5) * bin_width
+
+    # Value Area (70% объёма методом расширения от POC)
+    target_vol = total_vol * va_pct
+    accumulated_vol = float(bin_volumes[poc_idx])
+    upper_idx = poc_idx
+    lower_idx = poc_idx
+
+    while accumulated_vol < target_vol and (upper_idx < num_bins - 1 or lower_idx > 0):
+        next_up = float(bin_volumes[upper_idx + 1]) if upper_idx + 1 < num_bins else -1.0
+        next_down = float(bin_volumes[lower_idx - 1]) if lower_idx - 1 >= 0 else -1.0
+
+        if next_up >= next_down and next_up >= 0:
+            upper_idx += 1
+            accumulated_vol += next_up
+        elif next_down > next_up and next_down >= 0:
+            lower_idx -= 1
+            accumulated_vol += next_down
+        else:
+            break
+
+    val_level = float(min_low + lower_idx * bin_width)
+    vah_level = float(min_low + (upper_idx + 1) * bin_width)
+
+    return poc_level, val_level, vah_level
+
+
+def calculate_vpvr_poc(df: pd.DataFrame, lookback: int = 80, num_bins: int = 60) -> float:
+    """Для обратной совместимости: возвращает только POC."""
+    poc, _, _ = calculate_vpvr(df, lookback, num_bins)
+    return poc
 
 
 def calculate_tf_indicators(df: pd.DataFrame, tf_name: str) -> Optional[TFIndicators]:
@@ -136,7 +168,7 @@ def calculate_tf_indicators(df: pd.DataFrame, tf_name: str) -> Optional[TFIndica
     last_row = df_calc.iloc[-1]
     last_close = float(last_row["close"])
 
-    poc80 = calculate_vpvr_poc(df_calc, lookback=80, num_bins=60)
+    poc80, val80, vah80 = calculate_vpvr(df_calc, lookback=80, num_bins=60, va_pct=0.70)
 
     # Локальные экстремумы за последние 20 свечей
     subset20 = df_calc.iloc[-20:]
@@ -150,6 +182,8 @@ def calculate_tf_indicators(df: pd.DataFrame, tf_name: str) -> Optional[TFIndica
         atr14=float(last_row["atr14"]),
         rsi14=float(last_row["rsi14"]),
         poc80=poc80,
+        val80=val80,
+        vah80=vah80,
         swing_low_20=swing_low_20,
         swing_high_20=swing_high_20,
         close=last_close,

@@ -13,6 +13,14 @@ from src.utils import format_price, format_rub
 console = Console()
 
 
+def _get_trade_type_style(trade_type: str) -> str:
+    if "Following" in trade_type:
+        return "bold green"
+    elif "Reversal" in trade_type:
+        return "bold cyan"
+    return "bold yellow"
+
+
 def print_single_report(
     instrument: InstrumentInfo,
     indicators: Dict[str, TFIndicators],
@@ -45,14 +53,16 @@ def print_single_report(
 
     # 2. Таблица индикаторов
     table_ind = Table(title="Технические индикаторы по таймфреймам", header_style="bold yellow")
-    table_ind.add_column("Таймфрейм", justify="center")
+    table_ind.add_column("ТФ", justify="center")
     table_ind.add_column("EMA 20", justify="right")
     table_ind.add_column("EMA 50", justify="right")
     table_ind.add_column("ATR(14)", justify="right")
     table_ind.add_column("RSI(14)", justify="right")
-    table_ind.add_column("POC(80) VPVR", justify="right")
-    table_ind.add_column("Swing Low (20)", justify="right")
-    table_ind.add_column("Swing High (20)", justify="right")
+    table_ind.add_column("POC(80)", justify="right")
+    table_ind.add_column("VAL 70%", justify="right")
+    table_ind.add_column("VAH 70%", justify="right")
+    table_ind.add_column("Swing Low", justify="right")
+    table_ind.add_column("Swing High", justify="right")
 
     for tf in ["1H", "4H", "1D"]:
         if tf in indicators:
@@ -65,6 +75,8 @@ def print_single_report(
                 format_price(ind.atr14, step),
                 Text(f"{ind.rsi14:.1f}", style=rsi_style),
                 format_price(ind.poc80, step),
+                format_price(ind.val80, step),
+                format_price(ind.vah80, step),
                 format_price(ind.swing_low_20, step),
                 format_price(ind.swing_high_20, step),
             )
@@ -81,6 +93,7 @@ def print_single_report(
     ticket_table.add_column("Значение")
 
     ticket_table.add_row("Направление сделки:", Text(setup.direction, style="bold cyan"))
+    ticket_table.add_row("Тип сделки (Классификация):", Text(setup.trade_type, style=_get_trade_type_style(setup.trade_type)))
     ticket_table.add_row("Статус сетапа:", Text(setup.status, style=status_style))
 
     if setup.warning:
@@ -99,7 +112,10 @@ def print_single_report(
     # Для ACTIVE выводим подробные уровни и объёмы
     ticket_table.add_row("---", "---")
     ticket_table.add_row("Вход 1 (50% позиции):", f"{format_price(setup.entry_1, step)} ₽  [{setup.lots_entry_1} лот.]")
-    ticket_table.add_row("Вход 2 (50% позиции):", f"{format_price(setup.entry_2, step)} ₽  [{setup.lots_entry_2} лот.]")
+    ticket_table.add_row(
+        "Вход 2 (50% добор):",
+        f"{format_price(setup.entry_2, step)} ₽  [{setup.lots_entry_2} лот.]  (Опора: [cyan]{setup.entry_2_source}[/cyan])"
+    )
     ticket_table.add_row("Средняя цена входа:", f"{format_price(setup.entry_avg, step)} ₽")
     ticket_table.add_row("Якорь стопа (Anchor):", f"{format_price(setup.anchor_stop, step)} ₽")
     ticket_table.add_row("Стоп-лосс (Stop):", Text(f"{format_price(setup.stop, step)} ₽", style="bold red"))
@@ -149,25 +165,28 @@ def export_single_markdown(
     md.append(f"- **Размер лота:** {instrument.lot} шт.")
     md.append(f"- **Шорт у брокера:** {'Доступен' if instrument.short_enabled_flag else 'Запрещён'}")
     md.append(f"- **Господствующий тренд (1D/4H):** `{setup.senior_trend}`")
+    md.append(f"- **Тип сделки (Классификация):** `{setup.trade_type}`")
     md.append(f"- **Фон индекса IMOEX:** {imoex_str}")
     md.append("")
 
     # Таблица индикаторов
     md.append("## Технические индикаторы")
-    md.append("| Таймфрейм | EMA 20 | EMA 50 | ATR(14) | RSI(14) | POC(80) VPVR | Swing Low (20) | Swing High (20) |")
-    md.append("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    md.append("| ТФ | EMA 20 | EMA 50 | ATR(14) | RSI(14) | POC(80) | VAL 70% | VAH 70% | Swing Low | Swing High |")
+    md.append("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     for tf in ["1H", "4H", "1D"]:
         if tf in indicators:
             ind = indicators[tf]
             md.append(
                 f"| {tf} | {format_price(ind.ema20, step)} | {format_price(ind.ema50, step)} | "
                 f"{format_price(ind.atr14, step)} | {ind.rsi14:.1f} | {format_price(ind.poc80, step)} | "
+                f"{format_price(ind.val80, step)} | {format_price(ind.vah80, step)} | "
                 f"{format_price(ind.swing_low_20, step)} | {format_price(ind.swing_high_20, step)} |"
             )
     md.append("")
 
     # Сетап
     md.append(f"## Торговый план ({setup.direction})")
+    md.append(f"- **Классификация сделки:** `{setup.trade_type}`")
     md.append(f"- **Статус сетапа:** `{setup.status}`")
     if setup.warning:
         md.append(f"- **Предупреждение:** `{setup.warning}`")
@@ -180,7 +199,7 @@ def export_single_markdown(
         md.append("")
         md.append("### Параметры сделки и уровни")
         md.append(f"- **Вход 1 (50%):** `{format_price(setup.entry_1, step)} ₽` ({setup.lots_entry_1} лот.)")
-        md.append(f"- **Вход 2 (50%):** `{format_price(setup.entry_2, step)} ₽` ({setup.lots_entry_2} лот.)")
+        md.append(f"- **Вход 2 (50% добор):** `{format_price(setup.entry_2, step)} ₽` ({setup.lots_entry_2} лот.) [Опора: {setup.entry_2_source}]")
         md.append(f"- **Средняя цена входа:** `{format_price(setup.entry_avg, step)} ₽`")
         md.append(f"- **Якорь стопа:** `{format_price(setup.anchor_stop, step)} ₽`")
         md.append(f"- **Стоп-лосс:** `{format_price(setup.stop, step)} ₽`")
@@ -225,14 +244,15 @@ def print_screener_summary(
 
     table = Table(title="Результаты скрининга акций Мосбиржи", header_style="bold cyan")
     table.add_column("Тикер", justify="center")
-    table.add_column("Тренд 1D/4H", justify="center")
-    table.add_column("Направление", justify="center")
+    table.add_column("Тип сделки", justify="center")
+    table.add_column("Тренд", justify="center")
+    table.add_column("Напр.", justify="center")
     table.add_column("Текущая цена", justify="right")
     table.add_column("Вход (avg)", justify="right")
     table.add_column("Стоп", justify="right")
     table.add_column("Тейк 1", justify="right")
     table.add_column("Тейк 2", justify="right")
-    table.add_column("R/R (avg)", justify="right")
+    table.add_column("R/R", justify="right")
     table.add_column("Статус", justify="center")
     table.add_column("Прибыль / Примечание", justify="left")
 
@@ -245,6 +265,7 @@ def print_screener_summary(
         note = f"+{format_rub(s.total_profit_rub)}" if s.total_lots > 0 else (s.skip_reason or "-")
         table.add_row(
             s.ticker,
+            Text(s.trade_type, style=_get_trade_type_style(s.trade_type)),
             Text(s.senior_trend, style=t_style),
             s.direction,
             format_price(s.current_price, step),
@@ -266,16 +287,16 @@ def print_screener_summary(
         for i, s in enumerate(top_setups):
             medal = medals[i] if i < len(medals) else f"TOP-{i+1}"
             border_col = "bold green" if i == 0 else ("cyan" if i == 1 else "yellow")
-            
+
             warn_line = f"\n[bold red on yellow]Предупреждение: {s.warning}[/bold red on yellow]" if s.warning else ""
-            
+
             if s.total_lots > 0:
                 card_text = (
-                    f"[bold]{medal}: {s.ticker} ({s.direction})[/bold]  |  Тренд 1D/4H: {s.senior_trend}\n"
+                    f"[bold]{medal}: {s.ticker} ({s.direction})[/bold]  |  Тип: [{_get_trade_type_style(s.trade_type)}]{s.trade_type}[/]  |  Тренд 1D/4H: {s.senior_trend}\n"
                     f"R/R (средневзвеш.): [bold green]{s.rr:.2f}[/bold green]  |  Статус: {s.status}{warn_line}\n"
                     f"Вход 1 (50%): {format_price(s.entry_1, s.step)} ₽ [{s.lots_entry_1} лот.]  |  "
-                    f"Вход 2 (50%): {format_price(s.entry_2, s.step)} ₽ [{s.lots_entry_2} лот.]  |  "
-                    f"Средний вход: {format_price(s.entry_avg, s.step)} ₽\n"
+                    f"Вход 2 (50% добор): {format_price(s.entry_2, s.step)} ₽ [{s.lots_entry_2} лот.]  (Опора: [cyan]{s.entry_2_source}[/cyan])\n"
+                    f"Средний вход: {format_price(s.entry_avg, s.step)} ₽  |  "
                     f"Стоп-лосс: [bold red]{format_price(s.stop, s.step)} ₽[/bold red] (риск: -{format_rub(s.actual_loss_rub)})\n"
                     f"Тейк 1: [green]{format_price(s.take_1, s.step)} ₽[/green] [{s.lots_take_1} лот.]  |  "
                     f"Тейк 2: [bold green]{format_price(s.take_2, s.step)} ₽[/bold green] [{s.lots_take_2} лот.]\n"
@@ -285,7 +306,7 @@ def print_screener_summary(
             else:
                 ideal_str = f"  |  Идеальный вход: {format_price(s.ideal_entry, s.step)} ₽" if s.ideal_entry else ""
                 card_text = (
-                    f"[bold]{medal}: {s.ticker} ({s.direction})[/bold]  |  Тренд 1D/4H: {s.senior_trend}\n"
+                    f"[bold]{medal}: {s.ticker} ({s.direction})[/bold]  |  Тип: [{_get_trade_type_style(s.trade_type)}]{s.trade_type}[/]  |  Тренд 1D/4H: {s.senior_trend}\n"
                     f"R/R: {s.rr:.2f}  |  Статус: [red]{s.status}[/red]{warn_line}\n"
                     f"Причина пропуска: {s.skip_reason or 'R/R ниже порога'}{ideal_str}"
                 )
@@ -318,6 +339,16 @@ def export_screener_markdown(
     md.append(f"- **Рыночный фон (Индекс IMOEX):** `{imoex_str}`")
     md.append("")
 
+    # Статистика по типам сделок
+    tf_count = sum(1 for s in results if s.trade_type == "Trend Following" and s.total_lots > 0)
+    tr_count = sum(1 for s in results if s.trade_type == "Trend Reversal" and s.total_lots > 0)
+    ct_count = sum(1 for s in results if s.trade_type == "Counter Trend" and s.total_lots > 0)
+    md.append("## Статистика активных сделок по режимам")
+    md.append(f"- 📈 **Trend Following (по тренду):** {tf_count}")
+    md.append(f"- 🔄 **Trend Reversal (разворот 1H):** {tr_count}")
+    md.append(f"- ⚡ **Counter Trend (контртренд):** {ct_count}")
+    md.append("")
+
     if top_setups:
         medals = ["🥇 TOP-1", "🥈 TOP-2", "🥉 TOP-3"]
         md.append(f"## 🏆 ЛУЧШИЕ БУМАГИ ДНЯ (TOP-{len(top_setups)})")
@@ -325,6 +356,7 @@ def export_screener_markdown(
             medal = medals[i] if i < len(medals) else f"TOP-{i+1}"
             step = s.step
             md.append(f"### {medal}: {s.ticker} ({s.direction})")
+            md.append(f"- **Тип сделки (Классификация):** `{s.trade_type}`")
             md.append(f"- **Господствующий тренд (1D/4H):** `{s.senior_trend}`")
             md.append(f"- **Статус:** `{s.status}`")
             if s.warning:
@@ -333,7 +365,7 @@ def export_screener_markdown(
             md.append(f"- **Текущая цена:** `{format_price(s.current_price, step)} ₽`")
             if s.total_lots > 0:
                 md.append(f"- **Вход 1 (50%):** `{format_price(s.entry_1, step)} ₽` ({s.lots_entry_1} лот.)")
-                md.append(f"- **Вход 2 (50%):** `{format_price(s.entry_2, step)} ₽` ({s.lots_entry_2} лот.)")
+                md.append(f"- **Вход 2 (50% добор):** `{format_price(s.entry_2, step)} ₽` ({s.lots_entry_2} лот.) [Опора: {s.entry_2_source}]")
                 md.append(f"- **Средний вход:** `{format_price(s.entry_avg, step)} ₽`")
                 md.append(f"- **Стоп-лосс:** `{format_price(s.stop, step)} ₽`")
                 md.append(f"- **Тейк 1:** `{format_price(s.take_1, step)} ₽` ({s.lots_take_1} лот.)")
@@ -350,8 +382,8 @@ def export_screener_markdown(
         md.append("## 🏆 Лучшие бумаги дня: Нет сетапов с R/R >= 1.80 на текущий момент\n")
 
     md.append("## Таблица всех проверенных бумаг")
-    md.append("| Тикер | Тренд 1D/4H | Направление | Текущая цена | Вход (avg) | Стоп | Тейк 1 | Тейк 2 | R/R (avg) | Статус | Прибыль / Причина |")
-    md.append("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
+    md.append("| Тикер | Тип сделки | Тренд 1D/4H | Напр. | Текущая цена | Вход (avg) | Стоп | Тейк 1 | Тейк 2 | R/R | Статус | Прибыль / Причина |")
+    md.append("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
 
     for s in results:
         step = s.step
@@ -362,7 +394,7 @@ def export_screener_markdown(
         p_t2 = format_price(s.take_2, step) if s.take_2 > 0 else "-"
         rr_str = f"{s.rr:.2f}" if s.rr > 0 else "-"
         note = f"+{format_rub(s.total_profit_rub)}" if s.total_lots > 0 else (s.skip_reason or "-")
-        md.append(f"| {s.ticker} | {s.senior_trend} | {s.direction} | {p_curr} | {p_avg} | {p_stop} | {p_t1} | {p_t2} | {rr_str} | {s.status} | {note} |")
+        md.append(f"| {s.ticker} | {s.trade_type} | {s.senior_trend} | {s.direction} | {p_curr} | {p_avg} | {p_stop} | {p_t1} | {p_t2} | {rr_str} | {s.status} | {note} |")
 
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(md))

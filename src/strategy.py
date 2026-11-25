@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from src.indicators import TFIndicators
 from src.client import InstrumentInfo
 from src.utils import round_to_step
@@ -16,8 +16,9 @@ from src.config import (
 @dataclass
 class SetupResult:
     ticker: str
-    direction: str  # "LONG" или "SHORT"
-    status: str     # "ACTIVE (Strong)", "ACTIVE (Standard)", "SKIP (...)"
+    direction: str       # "LONG" или "SHORT"
+    status: str          # "ACTIVE (Strong)", "ACTIVE (Standard)", "SKIP (...)"
+    trade_type: str      # "Trend Following", "Trend Reversal", "Counter Trend"
     current_price: float
     senior_trend: str
     anchor_stop: float
@@ -25,6 +26,7 @@ class SetupResult:
     target_2: float
     entry_1: float
     entry_2: float
+    entry_2_source: str  # Источник второго входа: "Cluster (VAL + EMA50)", "Swing Low", etc.
     entry_avg: float
     stop: float
     take_1: float
@@ -33,7 +35,7 @@ class SetupResult:
     reward_t1_per_share: float
     reward_t2_per_share: float
     reward_avg_per_share: float
-    reward_per_share: float  # Для обратной совместимости = reward_avg_per_share
+    reward_per_share: float
     rr: float
     risk_rub: float
     ideal_entry: Optional[float]
@@ -54,12 +56,7 @@ class SetupResult:
 
 
 def get_senior_trend(indicators: Dict[str, TFIndicators]) -> str:
-    """
-    Определяет господствующий тренд на основе 4H_EMA50 и 1D_EMA20:
-    - Current_Price < 4H_EMA50 и Current_Price < 1D_EMA20 -> BEARISH
-    - Current_Price > 4H_EMA50 и Current_Price > 1D_EMA20 -> BULLISH
-    - Иначе -> NEUTRAL
-    """
+    """Определяет господствующий тренд на основе 4H_EMA50 и 1D_EMA20."""
     ind_1h = indicators.get("1H")
     ind_4h = indicators.get("4H")
     ind_1d = indicators.get("1D")
@@ -72,6 +69,135 @@ def get_senior_trend(indicators: Dict[str, TFIndicators]) -> str:
     elif price > ind_4h.ema50 and price > ind_1d.ema20:
         return "BULLISH"
     return "NEUTRAL"
+
+
+def classify_trade_type(direction: str, indicators: Dict[str, TFIndicators], senior_trend: str) -> str:
+    """
+    Классифицирует сделку по трендовому типу:
+    - Trend Following: по направлению старшего тренда 1D/4H.
+    - Trend Reversal: против старшего тренда, но с подтверждённым сломом структуры на 1H.
+    - Counter Trend: чистый контртренд без подтверждения смены структуры.
+    """
+    ind_1h = indicators.get("1H")
+    if not ind_1h:
+        return "Counter Trend" if senior_trend in ("BEARISH", "BULLISH") else "Trend Following"
+
+    price = ind_1h.close
+
+    if direction == "LONG":
+        if senior_trend == "BULLISH":
+            return "Trend Following"
+        elif senior_trend == "BEARISH":
+            # Слом структуры вверх на 1H: цена выше 1H EMA50 и выше 1H POC, RSI не в экстремальной перепроданности
+            if price > ind_1h.ema50 and price >= ind_1h.poc80 and ind_1h.rsi14 >= 45.0:
+                return "Trend Reversal"
+            return "Counter Trend"
+        else:
+            return "Trend Following" if price >= ind_1h.ema50 else "Counter Trend"
+
+    else:  # SHORT
+        if senior_trend == "BEARISH":
+            return "Trend Following"
+        elif senior_trend == "BULLISH":
+            # Слом структуры вниз на 1H: цена ниже 1H EMA50 и ниже 1H POC
+            if price < ind_1h.ema50 and price <= ind_1h.poc80 and ind_1h.rsi14 <= 55.0:
+                return "Trend Reversal"
+            return "Counter Trend"
+        else:
+            return "Trend Following" if price <= ind_1h.ema50 else "Counter Trend"
+
+
+def calculate_structural_entry_2(
+    direction: str,
+    entry_1: float,
+    anchor_stop: float,
+    atr_1h: float,
+    indicators: Dict[str, TFIndicators]
+) -> Tuple[float, str]:
+    """
+    Рассчитывает Entry_2 на основе структурного рейтинга и конфлюэнции (кластеризации) уровней:
+    - Для LONG: ищет подтверждённые поддержки между anchor_stop и entry_1 (VAL, Swing Low, EMA50, POC).
+    - Для SHORT: ищет сопротивления между entry_1 и anchor_stop (VAH, Swing High, EMA50, POC).
+    - При совпадении нескольких уровней (кластер) выбирается центр кластера.
+    - При отсутствии структурных кандидатов срабатывает fallback (геометрическая середина).
+    """
+    ind_1h = indicators.get("1H")
+    ind_4h = indicators.get("4H")
+    fallback_val = 0.5 * (entry_1 + anchor_stop)
+    fallback_desc = "Fallback (Midpoint)"
+
+    if not ind_1h:
+        return fallback_val, fallback_desc
+
+    candidates: List[Tuple[float, str, float]] = []  # (цена, название, вес)
+
+    if direction == "LONG":
+        lower_bound = anchor_stop
+        # Отступаем от entry_1 минимум на 0.2 ATR, чтобы уровни не слипались
+        upper_bound = entry_1 - 0.20 * atr_1h
+
+        if upper_bound <= lower_bound:
+            return fallback_val, fallback_desc
+
+        raw_candidates = [
+            (ind_1h.val80, "VAL 70%", 2.5),
+            (ind_1h.swing_low_20, "1H Swing Low", 2.0),
+            (ind_1h.ema50, "1H EMA50", 2.0),
+            (ind_1h.poc80, "1H POC", 1.5),
+        ]
+        if ind_4h:
+            raw_candidates.append((ind_4h.ema20, "4H EMA20", 1.5))
+
+        for price_lvl, name, weight in raw_candidates:
+            if lower_bound < price_lvl <= upper_bound:
+                candidates.append((price_lvl, name, weight))
+
+    else:  # SHORT
+        lower_bound = entry_1 + 0.20 * atr_1h
+        upper_bound = anchor_stop
+
+        if upper_bound <= lower_bound:
+            return fallback_val, fallback_desc
+
+        raw_candidates = [
+            (ind_1h.vah80, "VAH 70%", 2.5),
+            (ind_1h.swing_high_20, "1H Swing High", 2.0),
+            (ind_1h.ema50, "1H EMA50", 2.0),
+            (ind_1h.poc80, "1H POC", 1.5),
+        ]
+        if ind_4h:
+            raw_candidates.append((ind_4h.ema20, "4H EMA20", 1.5))
+
+        for price_lvl, name, weight in raw_candidates:
+            if lower_bound <= price_lvl < upper_bound:
+                candidates.append((price_lvl, name, weight))
+
+    if not candidates:
+        return fallback_val, fallback_desc
+
+    # Поиск кластеров (конфлюэнция уровней в радиусе 0.35 * ATR)
+    cluster_radius = 0.35 * atr_1h
+    best_score = -1.0
+    best_price = fallback_val
+    best_desc = fallback_desc
+
+    for i, (p_i, name_i, w_i) in enumerate(candidates):
+        # Собираем все уровни, попадающие в окрестность p_i
+        in_cluster = [c for c in candidates if abs(c[0] - p_i) <= cluster_radius]
+        total_weight = sum(c[2] for c in in_cluster)
+        # Центр масс кластера
+        cluster_price = sum(c[0] * c[2] for c in in_cluster) / total_weight
+
+        if total_weight > best_score:
+            best_score = total_weight
+            best_price = cluster_price
+            if len(in_cluster) > 1:
+                names = " + ".join(list(dict.fromkeys(c[1] for c in in_cluster)))
+                best_desc = f"Cluster ({names})"
+            else:
+                best_desc = in_cluster[0][1]
+
+    return best_price, best_desc
 
 
 def calculate_setup(
@@ -106,13 +232,14 @@ def calculate_setup(
     lot = instrument.lot
 
     senior_trend = get_senior_trend(indicators)
+    trade_type = classify_trade_type(direction, indicators, senior_trend)
 
     # Предупреждения: контртренд и шорт брокера
     warnings = []
-    if direction == "LONG" and senior_trend == "BEARISH":
+    if trade_type == "Counter Trend":
         warnings.append("ВНИМАНИЕ: КОНТРТРЕНД ПРОТИВ 1D/4H")
-    elif direction == "SHORT" and senior_trend == "BULLISH":
-        warnings.append("ВНИМАНИЕ: КОНТРТРЕНД ПРОТИВ 1D/4H")
+    elif trade_type == "Trend Reversal":
+        warnings.append("ИНФО: ПОТЕНЦИАЛЬНЫЙ РАЗВОРОТ СТРУКТУРЫ (Trend Reversal 1H)")
 
     if direction == "SHORT" and not instrument.short_enabled_flag:
         warnings.append("ВНИМАНИЕ: Шорт по данной бумаге запрещён брокером (short_enabled_flag == False)!")
@@ -127,9 +254,6 @@ def calculate_setup(
         entry_1 = max(current_price, min(ind_1h.ema20, ind_1h.poc80))
 
         # 2. Anchor_Stop:
-        # Старший уровень сопротивления строго выше текущей цены:
-        # 4H_EMA50 (если Current_Price < 4H_EMA50 - 0.5 * ATR_1H)
-        # либо max(1D_POC, 1D_EMA20)
         if current_price < ind_4h.ema50 - 0.5 * atr_1h:
             anchor_stop = ind_4h.ema50
         else:
@@ -147,8 +271,14 @@ def calculate_setup(
                 else:
                     anchor_stop = entry_1 + 1.5 * atr_1h
 
-        # Entry_2 (50%): 0.5 * (Entry_1 + Anchor_Stop) (строго ниже Stop)
-        entry_2 = 0.5 * (entry_1 + anchor_stop)
+        # 3. Структурный Entry_2 (50%): рейтинг уровней (VAL, Swing, EMA)
+        entry_2, entry_2_source = calculate_structural_entry_2(
+            direction="SHORT",
+            entry_1=entry_1,
+            anchor_stop=anchor_stop,
+            atr_1h=atr_1h,
+            indicators=indicators
+        )
 
         # Stop
         stop = anchor_stop + 0.6 * atr_1h
@@ -163,56 +293,50 @@ def calculate_setup(
         if risk_per_share_pre <= 0:
             return _make_skip_result(
                 instrument, direction, current_price, senior_trend,
-                reason="Риск на акцию <= 0 (стоп совпадает со средней ценой входа)"
+                reason="Риск на акцию <= 0 (стоп совпадает со средней ценой входа)",
+                trade_type=trade_type
             )
 
         # Пул локальных уровней поддержки для SHORT (1H и 4H):
         levels_pool = [
-            ind_1h.poc80, ind_1h.ema20, ind_1h.ema50, ind_1h.swing_low_20,
-            ind_4h.ema20, ind_4h.poc80, ind_4h.swing_low_20
+            ind_1h.poc80, ind_1h.val80, ind_1h.ema20, ind_1h.ema50, ind_1h.swing_low_20,
+            ind_4h.ema20, ind_4h.poc80, ind_4h.val80, ind_4h.swing_low_20
         ]
         upper_bound = min(current_price, entry_1_r)
         sorted_supports = sorted(list(set(lvl for lvl in levels_pool if lvl < upper_bound)), reverse=True)
 
         # Реалистичный коридор для Take 1:
-        # Минимальный ход: Reward_T1 >= 1.0 * Risk_per_share
         min_drop_t1 = risk_per_share_pre + COMMISSION * entry_avg_r
         max_t1_price = entry_avg_r - min_drop_t1
-        # Максимальный ход для Take 1: до 2.2 * Risk или 3.0 * ATR_1H
         max_drop_t1 = max(2.2 * risk_per_share_pre, 3.0 * atr_1h)
         min_t1_price = entry_avg_r - max_drop_t1
 
         target_1 = None
         take_1 = None
-        target_1_idx = -1
 
         for idx, lvl in enumerate(sorted_supports):
             t1_cand = lvl + 0.2 * atr_1h
             if min_t1_price <= t1_cand <= max_t1_price and t1_cand < entry_1_r:
                 target_1 = lvl
                 take_1 = t1_cand
-                target_1_idx = idx
                 break
 
         if target_1 is None:
-            # Если нет локального уровня в коридоре, ставим Take 1 на 1.2 * Risk
             take_1 = entry_avg_r - max(min_drop_t1, 1.2 * risk_per_share_pre)
             target_1 = take_1 - 0.2 * atr_1h
 
         # Реалистичный коридор для Take 2:
-        # Должен быть ниже Take 1, в диапазоне 2.0 * Risk ... 4.2 * Risk (не более 1.5 * ATR_1D / 5.5 * ATR_1H)
         min_drop_t2 = max(2.0 * risk_per_share_pre, (entry_avg_r - take_1) + 0.8 * atr_1h)
         max_drop_t2 = min(4.5 * risk_per_share_pre, max(5.0 * atr_1h, 1.5 * atr_1d))
         if max_drop_t2 < min_drop_t2:
             max_drop_t2 = min_drop_t2 + 1.0 * atr_1h
 
-        t2_window_high = entry_avg_r - min_drop_t2  # верхняя планка цены для T2 (< take_1)
-        t2_window_low = entry_avg_r - max_drop_t2   # нижняя реалистичная граница
+        t2_window_high = entry_avg_r - min_drop_t2
+        t2_window_low = entry_avg_r - max_drop_t2
 
         target_2 = None
         take_2 = None
 
-        # Ищем уровень поддержки ниже target_1, попадающий в реалистичный коридор T2
         remaining_supports = [lvl for lvl in sorted_supports if lvl < target_1]
         for lvl in remaining_supports:
             t2_cand = lvl + 0.2 * atr_1h
@@ -222,7 +346,6 @@ def calculate_setup(
                 break
 
         if target_2 is None:
-            # Устанавливаем сбалансированный свинговый Тейк 2 (2.5 * Risk)
             take_2 = entry_avg_r - min_drop_t2
             target_2 = take_2 - 0.2 * atr_1h
 
@@ -234,9 +357,6 @@ def calculate_setup(
         entry_1 = min(current_price, max(ind_1h.ema20, ind_1h.poc80))
 
         # 2. Anchor_Stop:
-        # Старший уровень поддержки строго ниже текущей цены:
-        # 4H_EMA50 (если Current_Price > 4H_EMA50 + 0.5 * ATR_1H)
-        # либо min(1D_POC, 1D_EMA20)
         if current_price > ind_4h.ema50 + 0.5 * atr_1h:
             anchor_stop = ind_4h.ema50
         else:
@@ -254,8 +374,14 @@ def calculate_setup(
                 else:
                     anchor_stop = entry_1 - 1.5 * atr_1h
 
-        # Entry_2 (50%): 0.5 * (Entry_1 + Anchor_Stop) (строго выше Stop)
-        entry_2 = 0.5 * (entry_1 + anchor_stop)
+        # 3. Структурный Entry_2 (50%): рейтинг уровней (VAL, Swing, EMA)
+        entry_2, entry_2_source = calculate_structural_entry_2(
+            direction="LONG",
+            entry_1=entry_1,
+            anchor_stop=anchor_stop,
+            atr_1h=atr_1h,
+            indicators=indicators
+        )
 
         # Stop
         stop = anchor_stop - 0.6 * atr_1h
@@ -270,13 +396,14 @@ def calculate_setup(
         if risk_per_share_pre <= 0:
             return _make_skip_result(
                 instrument, direction, current_price, senior_trend,
-                reason="Риск на акцию <= 0 (стоп совпадает со средней ценой входа)"
+                reason="Риск на акцию <= 0 (стоп совпадает со средней ценой входа)",
+                trade_type=trade_type
             )
 
         # Пул локальных уровней сопротивления для LONG (1H и 4H):
         levels_pool = [
-            ind_1h.poc80, ind_1h.ema20, ind_1h.ema50, ind_1h.swing_high_20,
-            ind_4h.ema20, ind_4h.poc80, ind_4h.swing_high_20
+            ind_1h.poc80, ind_1h.vah80, ind_1h.ema20, ind_1h.ema50, ind_1h.swing_high_20,
+            ind_4h.ema20, ind_4h.poc80, ind_4h.vah80, ind_4h.swing_high_20
         ]
         lower_bound = max(current_price, entry_1_r)
         sorted_resistances = sorted(list(set(lvl for lvl in levels_pool if lvl > lower_bound)))
@@ -289,14 +416,12 @@ def calculate_setup(
 
         target_1 = None
         take_1 = None
-        target_1_idx = -1
 
         for idx, lvl in enumerate(sorted_resistances):
             t1_cand = lvl - 0.2 * atr_1h
             if min_t1_price <= t1_cand <= max_t1_price and t1_cand > entry_1_r:
                 target_1 = lvl
                 take_1 = t1_cand
-                target_1_idx = idx
                 break
 
         if target_1 is None:
@@ -309,8 +434,8 @@ def calculate_setup(
         if max_rise_t2 < min_rise_t2:
             max_rise_t2 = min_rise_t2 + 1.0 * atr_1h
 
-        t2_window_low = entry_avg_r + min_rise_t2   # нижняя планка для T2 (> take_1)
-        t2_window_high = entry_avg_r + max_rise_t2  # верхняя реалистичная граница
+        t2_window_low = entry_avg_r + min_rise_t2
+        t2_window_high = entry_avg_r + max_rise_t2
 
         target_2 = None
         take_2 = None
@@ -341,18 +466,19 @@ def calculate_setup(
 
     entry_avg = round_to_step(0.5 * entry_1 + 0.5 * entry_2, step)
 
-    # Проверка геометрической корректности структуры
     if direction == "SHORT":
         if not (stop > entry_avg > take_2 and take_1 > take_2 and entry_1 > take_1):
             return _make_skip_result(
                 instrument, direction, current_price, senior_trend,
-                reason=f"Некорректная структура уровней SHORT (Stop={stop}, Entry_avg={entry_avg}, Take1={take_1}, Take2={take_2})"
+                reason=f"Некорректная структура уровней SHORT (Stop={stop}, Entry_avg={entry_avg}, Take1={take_1}, Take2={take_2})",
+                trade_type=trade_type
             )
     else:
         if not (stop < entry_avg < take_2 and take_1 < take_2 and entry_1 < take_1):
             return _make_skip_result(
                 instrument, direction, current_price, senior_trend,
-                reason=f"Некорректная структура уровней LONG (Stop={stop}, Entry_avg={entry_avg}, Take1={take_1}, Take2={take_2})"
+                reason=f"Некорректная структура уровней LONG (Stop={stop}, Entry_avg={entry_avg}, Take1={take_1}, Take2={take_2})",
+                trade_type=trade_type
             )
 
     # -------------------------------------------------------------
@@ -362,19 +488,17 @@ def calculate_setup(
     reward_t1_per_share = abs(take_1 - entry_avg) - COMMISSION * entry_avg
     reward_t2_per_share = abs(take_2 - entry_avg) - COMMISSION * entry_avg
 
-    # Средневзвешенная прибыль двух тейков (50% + 50%)
     reward_avg_per_share = 0.5 * reward_t1_per_share + 0.5 * reward_t2_per_share
 
     if risk_per_share <= 0:
         return _make_skip_result(
             instrument, direction, current_price, senior_trend,
-            reason="Риск на акцию <= 0 (стоп совпадает со средней ценой входа)"
+            reason="Риск на акцию <= 0 (стоп совпадает со средней ценой входа)",
+            trade_type=trade_type
         )
 
-    # Итоговый R/R считается по средневзвешенной прибыли
     rr = reward_avg_per_share / risk_per_share
 
-    # Расчёт Ideal_Entry при RR = 1.8 по средневзвешенной цене тейков Take_avg = 0.5 * (Take_1 + Take_2)
     take_avg = 0.5 * (take_1 + take_2)
     if direction == "SHORT":
         ideal_entry = (1.8 * stop + take_avg) / 2.7986
@@ -420,7 +544,6 @@ def calculate_setup(
         lots_entry_1 = total_lots // 2
         lots_entry_2 = total_lots - lots_entry_1
 
-        # Поправка ТЗ: если 1 лот, фиксируем 100% на Take 2 с безубытком на Take 1
         if total_lots == 1:
             lots_take_1 = 0
             lots_take_2 = 1
@@ -442,6 +565,7 @@ def calculate_setup(
         ticker=instrument.ticker,
         direction=direction,
         status=status,
+        trade_type=trade_type,
         current_price=current_price,
         senior_trend=senior_trend,
         anchor_stop=anchor_stop,
@@ -449,6 +573,7 @@ def calculate_setup(
         target_2=target_2,
         entry_1=entry_1,
         entry_2=entry_2,
+        entry_2_source=entry_2_source,
         entry_avg=entry_avg,
         stop=stop,
         take_1=take_1,
@@ -483,13 +608,15 @@ def _make_skip_result(
     direction: str,
     current_price: float,
     senior_trend: str,
-    reason: str
+    reason: str,
+    trade_type: str = "Counter Trend"
 ) -> SetupResult:
     """Создаёт результат со статусом SKIP при невозможности построения сетапа."""
     return SetupResult(
         ticker=instrument.ticker,
         direction=direction,
         status="SKIP",
+        trade_type=trade_type,
         current_price=current_price,
         senior_trend=senior_trend,
         anchor_stop=0.0,
@@ -497,6 +624,7 @@ def _make_skip_result(
         target_2=0.0,
         entry_1=0.0,
         entry_2=0.0,
+        entry_2_source="None",
         entry_avg=0.0,
         stop=0.0,
         take_1=0.0,
