@@ -43,32 +43,88 @@ class TInvestClient:
         return self._shares_cache
 
     def get_instrument_by_ticker(self, ticker: str) -> Optional[InstrumentInfo]:
-        """Находит акцию Мосбиржи (класс TQBR) по тикеру."""
+        """Находит акцию Мосбиржи (класс TQBR) по тикеру с локальным файловым кэшированием."""
+        import json, os
         ticker = ticker.upper().strip()
-        with Client(self.token) as client:
-            shares = self._get_all_shares(client)
-            match = next(
-                (s for s in shares if s.ticker.upper() == ticker and getattr(s, "class_code", "") == "TQBR"),
-                None
-            )
-            # Если по TQBR напрямую не найдено, пробуем найти среди любых акций с таким тикером
-            if not match:
-                match = next((s for s in shares if s.ticker.upper() == ticker), None)
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, "instruments.json")
 
-            if not match:
-                return None
+        # Проверяем локальный кэш
+        inst_cache = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    inst_cache = json.load(f)
+            except Exception:
+                inst_cache = {}
 
-            step = float(quotation_to_decimal(match.min_price_increment))
+        if ticker in inst_cache:
+            data = inst_cache[ticker]
             return InstrumentInfo(
-                ticker=match.ticker,
-                figi=match.figi,
-                uid=getattr(match, "uid", match.figi),
-                name=match.name,
-                lot=int(match.lot),
-                min_price_increment=step,
-                short_enabled_flag=bool(match.short_enabled_flag),
-                currency=getattr(match, "currency", "rub")
+                ticker=data["ticker"],
+                figi=data["figi"],
+                uid=data.get("uid", data["figi"]),
+                name=data["name"],
+                lot=data["lot"],
+                min_price_increment=data["min_price_increment"],
+                short_enabled_flag=data["short_enabled_flag"],
+                currency=data.get("currency", "rub")
             )
+
+        try:
+            with Client(self.token) as client:
+                shares = self._get_all_shares(client)
+                match = next(
+                    (s for s in shares if s.ticker.upper() == ticker and getattr(s, "class_code", "") == "TQBR"),
+                    None
+                )
+                if not match:
+                    match = next((s for s in shares if s.ticker.upper() == ticker), None)
+
+                if not match:
+                    return None
+
+                step = float(quotation_to_decimal(match.min_price_increment))
+                info = InstrumentInfo(
+                    ticker=match.ticker,
+                    figi=match.figi,
+                    uid=getattr(match, "uid", match.figi),
+                    name=match.name,
+                    lot=int(match.lot),
+                    min_price_increment=step,
+                    short_enabled_flag=bool(match.short_enabled_flag),
+                    currency=getattr(match, "currency", "rub")
+                )
+                # Сохраняем в кэш
+                inst_cache[ticker] = {
+                    "ticker": info.ticker,
+                    "figi": info.figi,
+                    "uid": info.uid,
+                    "name": info.name,
+                    "lot": info.lot,
+                    "min_price_increment": info.min_price_increment,
+                    "short_enabled_flag": info.short_enabled_flag,
+                    "currency": info.currency
+                }
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(inst_cache, f, ensure_ascii=False, indent=2)
+
+                return info
+        except Exception as e:
+            if ticker in inst_cache:
+                data = inst_cache[ticker]
+                return InstrumentInfo(
+                    ticker=data["ticker"],
+                    figi=data["figi"],
+                    uid=data.get("uid", data["figi"]),
+                    name=data["name"],
+                    lot=data["lot"],
+                    min_price_increment=data["min_price_increment"],
+                    short_enabled_flag=data["short_enabled_flag"],
+                    currency=data.get("currency", "rub")
+                )
+            raise
 
     def get_candles(self, figi: str, interval_type: str) -> pd.DataFrame:
         """

@@ -6,3 +6,4 @@ report_*.md
 screener_report.md
 .idea/
 .vscode/
+data_cache/
