@@ -44,6 +44,7 @@ class PlanState(str, Enum):
     ACTIVE_PARTIAL_TP1 = "ACTIVE_PARTIAL_TP1"           # Взят TP1, остаток удерживается до TP2
     CLOSED_FULL_PROFIT = "CLOSED_FULL_PROFIT"           # Успешно закрыт по TP2 (полный профит)
     CLOSED_STOP_LOSS = "CLOSED_STOP_LOSS"               # Закрыт по Stop-Loss
+    CLOSED_END_OF_BACKTEST = "CLOSED_END_OF_BACKTEST"   # Закрыт по рыночной цене в конце истории
     EXPIRED_NO_FILL = "EXPIRED_NO_FILL"                 # Истёк TTL без исполнения входов
     CANCELLED_HIT_STOP_ON_ENTRY = "CANCELLED_HIT_STOP_ON_ENTRY"  # На свече входа был задет и Стоп (отмена)
     CANCELLED_BEFORE_ENTRY = "CANCELLED_BEFORE_ENTRY"   # Стоп пробит до первого входа
@@ -68,12 +69,17 @@ class Position:
     side: str                          # "LONG" или "SHORT"
     total_shares: int = 0
     avg_price: float = 0.0
-    realized_pnl: float = 0.0
-    commission_paid: float = 0.0
+    realized_pnl: float = 0.0          # Валовый PnL (Gross PnL) без вычета комиссий
+    commission_paid: float = 0.0       # Суммарная уплаченная комиссия (входы + выходы)
     is_open: bool = False
     trades: List[Trade] = field(default_factory=list)
     opened_bar_idx: Optional[int] = None
     closed_bar_idx: Optional[int] = None
+
+    @property
+    def net_pnl(self) -> float:
+        """Чистый PnL с учётом всех уплаченных комиссий."""
+        return self.realized_pnl - self.commission_paid
 
 
 @dataclass
@@ -138,6 +144,7 @@ class ExecutionSimulator:
         if plan.state in (
             PlanState.CLOSED_FULL_PROFIT,
             PlanState.CLOSED_STOP_LOSS,
+            PlanState.CLOSED_END_OF_BACKTEST,
             PlanState.EXPIRED_NO_FILL,
             PlanState.CANCELLED_HIT_STOP_ON_ENTRY,
             PlanState.CANCELLED_BEFORE_ENTRY
@@ -230,6 +237,10 @@ class ExecutionSimulator:
                     self._apply_entry_trade(plan.position, trade2, candle_idx)
                     plan.state = PlanState.ACTIVE_E1_E2
                     events.append(f"[{c_time}] {plan.ticker} ВХОД 2 исполнен на той же свече: {trade2.shares} шт. по {fill2_price:.3f} ₽")
+
+                # Если TP1 был достигнут на той же свече (даже если Entry 2 не исполнился)
+                if tp1_reachable:
+                    self._execute_take_profit_1(plan, candle_idx, candle, events)
 
                 return events
 
@@ -470,7 +481,7 @@ class ExecutionSimulator:
             slippage=slip
         )
         pos.commission_paid += comm
-        pos.realized_pnl += (pnl_gross - comm)
+        pos.realized_pnl += pnl_gross
         pos.trades.append(trade)
         pos.total_shares = 0
         pos.is_open = False
@@ -480,7 +491,7 @@ class ExecutionSimulator:
         plan.close_reason = "STOP_LOSS"
         events.append(
             f"[{c_time}] {plan.ticker} СТОП-ЛОСС сработал: закрыто по {final_exit:.3f} ₽ "
-            f"(Убыток: {pnl_gross - comm:.2f} ₽, проскальзывание: {slip:.3f} ₽)"
+            f"(Убыток gross: {pnl_gross:+.2f} ₽, ком.: {comm:.2f} ₽, проскальзывание: {slip:.3f} ₽)"
         )
 
     def _execute_take_profit_1(
@@ -537,7 +548,7 @@ class ExecutionSimulator:
             slippage=slip
         )
         pos.commission_paid += comm
-        pos.realized_pnl += (pnl_gross - comm)
+        pos.realized_pnl += pnl_gross
         pos.trades.append(trade)
         pos.total_shares -= shares_to_close
 
@@ -551,7 +562,7 @@ class ExecutionSimulator:
 
         events.append(
             f"[{c_time}] {plan.ticker} ТЕЙК 1 зафиксирован: {shares_to_close} шт. по {final_exit:.3f} ₽ "
-            f"(Прибыль: +{pnl_gross - comm:.2f} ₽). Добор Entry 2 отменён."
+            f"(Прибыль gross: {pnl_gross:+.2f} ₽, ком.: {comm:.2f} ₽). Добор Entry 2 отменён."
         )
 
     def _execute_take_profit_2(
@@ -595,7 +606,7 @@ class ExecutionSimulator:
             slippage=slip
         )
         pos.commission_paid += comm
-        pos.realized_pnl += (pnl_gross - comm)
+        pos.realized_pnl += pnl_gross
         pos.trades.append(trade)
         pos.total_shares = 0
         pos.is_open = False
@@ -605,5 +616,56 @@ class ExecutionSimulator:
         plan.close_reason = "TAKE_2_FULL"
         events.append(
             f"[{c_time}] {plan.ticker} ТЕЙК 2 исполнен: закрыт остаток {shares_to_close} шт. по {final_exit:.3f} ₽ "
-            f"(Прибыль: +{pnl_gross - comm:.2f} ₽). План полностью завершён."
+            f"(Прибыль gross: {pnl_gross:+.2f} ₽, ком.: {comm:.2f} ₽). План полностью завершён."
+        )
+
+    def close_position_at_market(
+        self,
+        plan: TradePlan,
+        candle_idx: int,
+        candle: Dict[str, Any],
+        events: List[str],
+        reason: str = "END_OF_BACKTEST"
+    ):
+        """
+        Закрывает открытую позицию по рыночной цене закрытия текущей свечи (Close).
+        Используется принудительно в конце бэктеста без стопового штрафного проскальзывания.
+        """
+        pos = plan.position
+        if pos.total_shares <= 0 or not pos.is_open:
+            return
+
+        c_time = candle.get("time")
+        c_close = float(candle["close"])
+        final_exit = c_close
+
+        if plan.direction == "LONG":
+            pnl_gross = (final_exit - pos.avg_price) * pos.total_shares
+        else:
+            pnl_gross = (pos.avg_price - final_exit) * pos.total_shares
+
+        comm = final_exit * pos.total_shares * self.cfg.commission_exit_rate
+        trade = Trade(
+            trade_id=f"{plan.plan_id}_{reason}",
+            ticker=plan.ticker,
+            side=OrderSide.SELL if plan.direction == "LONG" else OrderSide.BUY,
+            shares=pos.total_shares,
+            price=final_exit,
+            commission=comm,
+            timestamp=c_time,
+            reason=reason,
+            slippage=0.0
+        )
+        pos.commission_paid += comm
+        pos.realized_pnl += pnl_gross
+        pos.trades.append(trade)
+        pos.total_shares = 0
+        pos.is_open = False
+        pos.closed_bar_idx = candle_idx
+
+        plan.state = PlanState.CLOSED_END_OF_BACKTEST
+        plan.close_reason = reason
+        events.append(
+            f"[{c_time}] {plan.ticker} Закрытие по рынку ({reason}) по {final_exit:.3f} ₽ "
+            f"(PnL gross: {pnl_gross:+.2f} ₽, ком.: {comm:.2f} ₽)"
         )

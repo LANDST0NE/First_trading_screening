@@ -80,6 +80,7 @@ class BacktestMetrics:
     tp1_only_exits: int = 0
     tp2_full_exits: int = 0
     stop_loss_exits: int = 0
+    end_of_backtest_exits: int = 0
 
     # 5. Временные характеристики
     avg_bars_in_trade: float = 0.0
@@ -116,7 +117,8 @@ class MetricsCalculator:
             if p.state in (
                 PlanState.CLOSED_FULL_PROFIT,
                 PlanState.CLOSED_STOP_LOSS,
-                PlanState.ACTIVE_PARTIAL_TP1,  # Если бэктест завершился, а часть позиции еще открыта
+                PlanState.CLOSED_END_OF_BACKTEST,
+                PlanState.ACTIVE_PARTIAL_TP1,
                 PlanState.ACTIVE_E1,
                 PlanState.ACTIVE_E1_E2
             ) or (p.position.trades and not p.position.is_open):
@@ -129,19 +131,23 @@ class MetricsCalculator:
         m.executed_plans = len(executed_plans)
 
         # Подсчёт PnL и сделок
-        profits: List[float] = []
-        losses: List[float] = []
+        gross_profits: List[float] = []
+        gross_losses: List[float] = []
         holding_bars: List[int] = []
 
-        total_net_pnl = 0.0
+        total_gross_pnl = 0.0
         total_comm = 0.0
 
         for p in executed_plans:
             pos = p.position
-            pnl = pos.realized_pnl
+            # pos.realized_pnl — это чистый курсовой PnL (Gross)
+            # pos.commission_paid — суммарная комиссия (вход + выход)
+            # pos.net_pnl — финансовый результат после комиссий
+            pnl_gross = pos.realized_pnl
             comm = pos.commission_paid
+            pnl_net = pos.net_pnl
 
-            total_net_pnl += pnl
+            total_gross_pnl += pnl_gross
             total_comm += comm
 
             # Длительность удержания позиции (в барах)
@@ -158,29 +164,37 @@ class MetricsCalculator:
                 m.entry1_only_count += 1
 
             # Анализ выходов
-            if p.state == PlanState.CLOSED_FULL_PROFIT or p.close_reason == "TAKE_2":
+            if p.state == PlanState.CLOSED_FULL_PROFIT or p.close_reason in ("TAKE_2", "TAKE_2_FULL"):
                 m.tp2_full_exits += 1
             elif p.state == PlanState.CLOSED_STOP_LOSS or p.close_reason == "STOP_LOSS":
                 m.stop_loss_exits += 1
+            elif p.state == PlanState.CLOSED_END_OF_BACKTEST or p.close_reason == "END_OF_BACKTEST":
+                m.end_of_backtest_exits += 1
             elif p.close_reason == "TAKE_1_FULL" or any(t.reason == "TAKE_1" for t in pos.trades):
                 m.tp1_only_exits += 1
 
-            if pnl > 0.01:
+            # Разделение по Gross PnL
+            if pnl_gross > 0.0001:
+                gross_profits.append(pnl_gross)
+            elif pnl_gross < -0.0001:
+                gross_losses.append(pnl_gross)
+
+            # Определение выигрыша/проигрыша по Net PnL (с учётом комиссий)
+            if pnl_net > 0.01:
                 m.winning_plans += 1
-                profits.append(pnl)
-            elif pnl < -0.01:
+            elif pnl_net < -0.01:
                 m.losing_plans += 1
-                losses.append(pnl)
             else:
                 m.breakeven_plans += 1
 
-        # Общие финансовые метрики
-        m.net_profit = total_net_pnl
-        m.final_capital = initial_capital + total_net_pnl
-        m.net_profit_pct = (total_net_pnl / initial_capital * 100.0) if initial_capital > 0 else 0.0
+        # Общие финансовые метрики (СТРОГО СОГЛАСОВАННЫЕ):
+        # Net Profit = Gross Profit - Gross Loss - Total Commissions
+        m.gross_profit = sum(gross_profits)
+        m.gross_loss = abs(sum(gross_losses))
         m.total_commissions = total_comm
-        m.gross_profit = sum(profits)
-        m.gross_loss = abs(sum(losses))
+        m.net_profit = m.gross_profit - m.gross_loss - m.total_commissions
+        m.final_capital = initial_capital + m.net_profit
+        m.net_profit_pct = (m.net_profit / initial_capital * 100.0) if initial_capital > 0 else 0.0
 
         # Win Rate и Payoff
         if m.executed_plans > 0:
@@ -189,10 +203,10 @@ class MetricsCalculator:
             m.entry1_only_pct = (m.entry1_only_count / m.executed_plans) * 100.0
             m.both_entries_pct = (m.both_entries_count / m.executed_plans) * 100.0
 
-        if profits:
-            m.avg_win_rub = sum(profits) / len(profits)
-        if losses:
-            m.avg_loss_rub = abs(sum(losses) / len(losses))
+        if gross_profits:
+            m.avg_win_rub = sum(gross_profits) / len(gross_profits)
+        if gross_losses:
+            m.avg_loss_rub = abs(sum(gross_losses) / len(gross_losses))
 
         if m.avg_loss_rub > 0:
             m.payoff_ratio = m.avg_win_rub / m.avg_loss_rub
@@ -207,7 +221,8 @@ class MetricsCalculator:
         # Математическое ожидание на одну сделку (в рублях)
         wr = m.win_rate_pct / 100.0
         lr = m.loss_rate_pct / 100.0
-        m.expectancy_rub = (wr * m.avg_win_rub) - (lr * m.avg_loss_rub)
+        avg_comm_per_trade = (m.total_commissions / m.executed_plans) if m.executed_plans > 0 else 0.0
+        m.expectancy_rub = (wr * m.avg_win_rub) - (lr * m.avg_loss_rub) - avg_comm_per_trade
 
         if holding_bars:
             m.avg_bars_in_trade = sum(holding_bars) / len(holding_bars)
@@ -277,33 +292,39 @@ class MetricsCalculator:
             exec_plans = [p for p in group_plans if p.position.trades and not p.position.is_open]
             sm.executed_plans = len(exec_plans)
 
-            profits: List[float] = []
-            losses: List[float] = []
+            gross_profits: List[float] = []
+            gross_losses: List[float] = []
 
             for p in exec_plans:
-                pnl = p.position.realized_pnl
-                sm.net_profit += pnl
-                sm.commissions += p.position.commission_paid
+                pnl_gross = p.position.realized_pnl
+                comm = p.position.commission_paid
+                pnl_net = p.position.net_pnl
 
-                if pnl > 0.01:
+                sm.commissions += comm
+
+                if pnl_gross > 0.0001:
+                    gross_profits.append(pnl_gross)
+                elif pnl_gross < -0.0001:
+                    gross_losses.append(pnl_gross)
+
+                if pnl_net > 0.01:
                     sm.winning_plans += 1
-                    profits.append(pnl)
-                elif pnl < -0.01:
+                elif pnl_net < -0.01:
                     sm.losing_plans += 1
-                    losses.append(pnl)
                 else:
                     sm.breakeven_plans += 1
 
-            sm.gross_profit = sum(profits)
-            sm.gross_loss = abs(sum(losses))
+            sm.gross_profit = sum(gross_profits)
+            sm.gross_loss = abs(sum(gross_losses))
+            sm.net_profit = sm.gross_profit - sm.gross_loss - sm.commissions
 
             if sm.executed_plans > 0:
                 sm.win_rate_pct = (sm.winning_plans / sm.executed_plans) * 100.0
 
-            if profits:
-                sm.avg_win = sum(profits) / len(profits)
-            if losses:
-                sm.avg_loss = abs(sum(losses) / len(losses))
+            if gross_profits:
+                sm.avg_win = sum(gross_profits) / len(gross_profits)
+            if gross_losses:
+                sm.avg_loss = abs(sum(gross_losses) / len(gross_losses))
 
             if sm.avg_loss > 0:
                 sm.payoff_ratio = sm.avg_win / sm.avg_loss
@@ -317,7 +338,8 @@ class MetricsCalculator:
 
             wr = sm.win_rate_pct / 100.0
             lr = (sm.losing_plans / sm.executed_plans) if sm.executed_plans > 0 else 0.0
-            sm.expectancy = (wr * sm.avg_win) - (lr * sm.avg_loss)
+            avg_comm = (sm.commissions / sm.executed_plans) if sm.executed_plans > 0 else 0.0
+            sm.expectancy = (wr * sm.avg_win) - (lr * sm.avg_loss) - avg_comm
 
             result[name] = sm
 

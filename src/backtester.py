@@ -213,10 +213,11 @@ class Backtester:
                 delta_rub = (new_pnl - prev_pnl) - (new_comm - prev_comm)
                 curr_capital += delta_rub
 
-                # Если план завершён (стоп, полный тейк, отмена или экспирация)
+                # Если план завершён (стоп, полный тейк, отмена, закрытие в конце или экспирация)
                 if active_plan.state in (
                     PlanState.CLOSED_FULL_PROFIT,
                     PlanState.CLOSED_STOP_LOSS,
+                    PlanState.CLOSED_END_OF_BACKTEST,
                     PlanState.EXPIRED_NO_FILL,
                     PlanState.CANCELLED_HIT_STOP_ON_ENTRY,
                     PlanState.CANCELLED_BEFORE_ENTRY
@@ -235,9 +236,14 @@ class Backtester:
                 # Срез данных СТРОГО до закрытой свечи t включительно (No Lookahead Bias)
                 sub_1h = df_1h.iloc[: t + 1]
 
-                # Для 4H и 1D берем только свечи, время закрытия которых <= curr_time
-                sub_4h = df_4h[df_4h["time"] <= curr_time]
-                sub_1d = df_1d[df_1d["time"] <= curr_time]
+                # Для 4H и 1D: время закрытия старших свечей должно строго наступать ДО или В МОМЕНТ
+                # закрытия текущей 1H-свечи (curr_close_time = curr_time + 1 час).
+                # Поскольку поле 'time' в API обозначает время НАЧАЛА свечи:
+                # 4H закрывается через 4 часа: time + 4h <= curr_close_time
+                # 1D закрывается строго в конце торгового дня: дата дневной свечи должна быть строго меньше текущей даты
+                curr_close_time = curr_time + pd.Timedelta(hours=1)
+                sub_4h = df_4h[df_4h["time"] + pd.Timedelta(hours=4) <= curr_close_time]
+                sub_1d = df_1d[df_1d["time"].dt.date < curr_time.date()]
 
                 # Требуется минимальная глубина для EMA и ATR
                 if len(sub_1h) >= 60 and len(sub_4h) >= 30 and len(sub_1d) >= 20:
@@ -316,9 +322,17 @@ class Backtester:
                 "close": float(last_candle["close"]),
                 "volume": 0
             }
-            # Закрываем остаток позиции
-            self.simulator._close_position_by_stop(active_plan, total_1h_bars - 1, c_dict, [])
-            active_plan.close_reason = "END_OF_BACKTEST"
+            # Закрываем остаток позиции по рыночной цене без штрафного проскальзывания стопа
+            prev_gross = active_plan.position.realized_pnl
+            prev_comm = active_plan.position.commission_paid
+            self.simulator.close_position_at_market(active_plan, total_1h_bars - 1, c_dict, [], reason="END_OF_BACKTEST")
+            new_gross = active_plan.position.realized_pnl
+            new_comm = active_plan.position.commission_paid
+            curr_capital += (new_gross - prev_gross) - (new_comm - prev_comm)
+            equity_curve.append({
+                "time": last_candle["time"],
+                "equity": curr_capital
+            })
 
         metrics = MetricsCalculator.calculate(
             plans=plans,
@@ -373,6 +387,8 @@ def print_backtest_report(metrics: BacktestMetrics, ticker: str = "PORTFOLIO"):
     t_stat.add_row("Выходы: Stop-Loss", f"[red]{metrics.stop_loss_exits}[/red]")
     t_stat.add_row("Выходы: Take Profit 1 (частичные)", f"[yellow]{metrics.tp1_only_exits}[/yellow]")
     t_stat.add_row("Выходы: Take Profit 2 (полный профит)", f"[green]{metrics.tp2_full_exits}[/green]")
+    if metrics.end_of_backtest_exits > 0:
+        t_stat.add_row("Выходы: Закрыто в конце теста", f"[blue]{metrics.end_of_backtest_exits}[/blue]")
     t_stat.add_row("Среднее время в сделке", f"{metrics.avg_bars_in_trade:.1f} часовых свечей")
     console.print(t_stat)
 
