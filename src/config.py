@@ -23,6 +23,14 @@ RISK_STRONG = 1750.0       # Риск при RR >= 2.5
 MIN_RR_THRESHOLD = 1.8
 STRONG_RR_THRESHOLD = 2.5
 
+# Структурный анализ: параметры пробоя, ретеста и буферов Entry 2
+BREAKOUT_BUFFER_ATR_MULT = 0.10      # Буфер пробоя (0.10 * ATR_1H)
+MIN_DISTANCE_STOP_ATR_MULT = 0.20    # Минимальное расстояние Entry 2 до Anchor Stop (0.20 * ATR_1H)
+MIN_DISTANCE_ENTRY_ATR_MULT = 0.20   # Минимальное расстояние Entry 2 до Entry 1 (0.20 * ATR_1H)
+
+RETEST_WINDOW_BARS = 3               # Окно наблюдения ретеста (3 закрытые часовые свечи после пробоя)
+RETEST_ZONE_PENETRATION_MULT = 0.10  # Допустимое проникновение за уровень при ретесте (0.10 * ATR_1H)
+
 # Минимальные требования к числу свечей
 MIN_CANDLES_1H = 150
 MIN_CANDLES_4H = 120

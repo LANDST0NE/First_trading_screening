@@ -16,7 +16,9 @@ console = Console()
 def _get_trade_type_style(trade_type: str) -> str:
     if "Following" in trade_type:
         return "bold green"
-    elif "Confirmed Reversal" in trade_type:
+    elif "Retest Confirmed" in trade_type:
+        return "bold green"
+    elif "Breakout Confirmed" in trade_type or "Confirmed Reversal" in trade_type:
         return "bold magenta"
     elif "Candidate" in trade_type:
         return "bold cyan"
@@ -104,10 +106,26 @@ def print_single_report(
     quality_table.add_row("Часовая структура (1H):", Text(setup.market_structure_1h, style="cyan"))
     quality_table.add_row("Последний Pivot High (L=3, R=2):", ph_str)
     quality_table.add_row("Последний Pivot Low (L=3, R=2):", pl_str)
+
+    if setup.breakout_threshold:
+        dir_sign = "+" if setup.direction == "LONG" else "-"
+        quality_table.add_row(
+            f"Порог пробоя (с буфером 0.1 ATR):",
+            f"{format_price(setup.breakout_threshold, step)} ₽  (Pivot {dir_sign} 0.10 ATR)"
+        )
+
+    if setup.breakout_status and setup.breakout_status != "None":
+        bo_style = "bold green" if "Retest" in setup.breakout_status else "bold magenta"
+        quality_table.add_row("Статус пробоя / ретеста:", Text(setup.breakout_status, style=bo_style))
+
     quality_table.add_row(
         "Классификация сделки:",
         Text(setup.trade_type, style=_get_trade_type_style(setup.trade_type))
     )
+
+    if setup.reversal_diagnostics:
+        quality_table.add_row("Диагностика кандидата:", Text(setup.reversal_diagnostics, style="cyan"))
+
     quality_table.add_row("Условие подтверждения:", Text(setup.confirmation_trigger, style="bold green"))
     quality_table.add_row("Условие отмены сценария:", Text(setup.invalidation_trigger, style="bold red"))
 
@@ -206,6 +224,13 @@ def export_single_markdown(
     md.append(f"- **Часовая структура:** `{setup.market_structure_1h}`")
     md.append(f"- **Последний подтверждённый Pivot High (L=3, R=2):** `{ph_str}`")
     md.append(f"- **Последний подтверждённый Pivot Low (L=3, R=2):** `{pl_str}`")
+    if setup.breakout_threshold:
+        dir_sign = "+" if setup.direction == "LONG" else "-"
+        md.append(f"- **Порог пробоя (с буфером 0.1 ATR):** `{format_price(setup.breakout_threshold, step)} ₽` (Pivot {dir_sign} 0.10 ATR)")
+    if setup.breakout_status and setup.breakout_status != "None":
+        md.append(f"- **Статус пробоя / ретеста:** `{setup.breakout_status}`")
+    if setup.reversal_diagnostics:
+        md.append(f"- **Диагностика кандидата в разворот:** `{setup.reversal_diagnostics}`")
     md.append(f"- **Условие подтверждения сценария:** {setup.confirmation_trigger}")
     md.append(f"- **Условие отмены сценария (Invalidation):** `{setup.invalidation_trigger}`")
     md.append("")

@@ -113,7 +113,8 @@ class TInvestClient:
                 "high": float(quotation_to_decimal(c.high)),
                 "low": float(quotation_to_decimal(c.low)),
                 "close": float(quotation_to_decimal(c.close)),
-                "volume": int(c.volume)
+                "volume": int(c.volume),
+                "is_complete": bool(getattr(c, "is_complete", True))
             })
 
         df = pd.DataFrame(rows)

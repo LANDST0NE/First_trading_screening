@@ -2,14 +2,17 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 from src.indicators import TFIndicators, PivotPoint
 from src.client import InstrumentInfo
-from src.utils import round_to_step
+from src.utils import round_to_step, format_price
 from src.config import (
     COMMISSION,
     DAILY_RISK_LIMIT,
     RISK_STANDARD,
     RISK_STRONG,
     MIN_RR_THRESHOLD,
-    STRONG_RR_THRESHOLD
+    STRONG_RR_THRESHOLD,
+    BREAKOUT_BUFFER_ATR_MULT,
+    MIN_DISTANCE_STOP_ATR_MULT,
+    MIN_DISTANCE_ENTRY_ATR_MULT
 )
 
 
@@ -18,7 +21,7 @@ class SetupResult:
     ticker: str
     direction: str             # "LONG" или "SHORT"
     status: str                # "ACTIVE (Strong)", "ACTIVE (Standard)", "SKIP (...)"
-    trade_type: str            # "Trend Following", "Confirmed Reversal", "Reversal Candidate", "Counter Trend", "MIXED / NO TRADE"
+    trade_type: str            # "Trend Following", "Retest Confirmed", "Breakout Confirmed", "Reversal Candidate", "Counter Trend", "MIXED / NO TRADE"
     current_price: float
     senior_trend: str
     market_structure_1h: str   # Описание часовой структуры (Pivots)
@@ -58,6 +61,9 @@ class SetupResult:
     lot_size: int
     skip_reason: Optional[str] = None
     warning: Optional[str] = None
+    reversal_diagnostics: Optional[str] = None
+    breakout_status: Optional[str] = None
+    breakout_threshold: Optional[float] = None
 
 
 def get_senior_trend(indicators: Dict[str, TFIndicators]) -> str:
@@ -80,62 +86,101 @@ def classify_trade_type(
     direction: str,
     indicators: Dict[str, TFIndicators],
     senior_trend: str
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str, str, Optional[str], Optional[str], Optional[float]]:
     """
     Классифицирует сделку по строгой 4-уровневой иерархии приоритета:
     1. Trend Following (по старшему тренду)
-    2. Confirmed Reversal (подтверждённый слом структуры закрытием за пивот)
+    2. Retest Confirmed / Breakout Confirmed (подтверждённый слом структуры)
     3. Reversal Candidate (локальное восстановление выше/ниже EMA50 и POC)
     4. Counter Trend (контртрендовый отскок)
-    или MIXED / NO TRADE при противоречиях.
+    или MIXED / NO TRADE при противоречиях или узком боковике.
     
     Возвращает:
-    (trade_type, confirmation_trigger, invalidation_trigger_desc)
+    (trade_type, confirmation_trigger, invalidation_trigger_desc, reversal_diagnostics, breakout_status, breakout_threshold)
     """
     ind_1h = indicators.get("1H")
     if not ind_1h:
-        return "Counter Trend", "Недостаточно данных 1H", "Пробой стоп-лосса"
+        return "Counter Trend", "Недостаточно данных 1H", "Пробой стоп-лосса", None, None, None
 
     price = ind_1h.close
     atr_1h = ind_1h.atr14
     last_ph = ind_1h.last_pivot_high
     last_pl = ind_1h.last_pivot_low
 
-    ph_price_str = f"{last_ph.price:.2f} ₽" if last_ph else "N/A"
-    pl_price_str = f"{last_pl.price:.2f} ₽" if last_pl else "N/A"
+    # Буфер пробоя
+    buffer_val = BREAKOUT_BUFFER_ATR_MULT * atr_1h
+    th_long = (last_ph.price + buffer_val) if last_ph else None
+    th_short = (last_pl.price - buffer_val) if last_pl else None
+
+    # Оценка состояния флэта / консолидации около 1H EMA50
+    is_consolidation = (abs(price - ind_1h.ema50) < 0.40 * atr_1h) and (45.0 <= ind_1h.rsi14 <= 55.0)
+
+    # Статусы пробоя / ретеста из indicators
+    bo_long = getattr(ind_1h, "breakout_info_long", None)
+    bo_short = getattr(ind_1h, "breakout_info_short", None)
+
+    reversal_diag = None
+    breakout_status = None
+    breakout_threshold = None
 
     if direction == "LONG":
-        # 1. Приоритет: Trend Following
+        breakout_threshold = th_long
+        if bo_long:
+            breakout_status = bo_long.status
+
+        # 1. Приоритет: Trend Following (по старшему тренду)
         if senior_trend == "BULLISH":
             if price >= ind_1h.ema50 or ind_1h.rsi14 >= 40.0:
                 trade_type = "Trend Following"
                 conf_trigger = f"Удержание выше 1H EMA20/EMA50 ({ind_1h.ema20:.2f} ₽) и закрытие текущего часа"
             else:
                 trade_type = "Counter Trend"
-                conf_trigger = f"Глубокий откат; возврат и закрепление выше 1H EMA50 ({ind_1h.ema50:.2f} ₽)"
+                conf_trigger = f"Глубокий откат против тренда; возврат и закрепление выше 1H EMA50 ({ind_1h.ema50:.2f} ₽)"
 
-        # 2. Приоритет: Confirmed Reversal (при медвежьем или смешанном старшем тренде)
-        elif last_ph and (price > last_ph.price + 0.10 * atr_1h):
+        # 2. Приоритет: Retest Confirmed (пробой с подтверждённым ретестом)
+        elif bo_long and bo_long.status == "Retest Confirmed":
             trade_type = "Confirmed Reversal"
-            conf_trigger = f"Подтверждено: закрытие 1H выше последнего Pivot High ({ph_price_str}) с удержанием"
+            conf_trigger = f"Ретест подтверждён: {bo_long.description}"
 
-        # 3. Приоритет: Reversal Candidate
-        elif (price > ind_1h.ema50) and (price >= ind_1h.poc80) and (ind_1h.rsi14 >= 45.0):
-            trade_type = "Reversal Candidate"
-            conf_trigger = f"Пробой и закрытие часа выше подтверждённого 1H Pivot High ({ph_price_str})"
+        # 3. Приоритет: Breakout Confirmed (пробой закрытием часовой свечи)
+        elif bo_long and bo_long.status == "Breakout Confirmed":
+            trade_type = "Confirmed Reversal"
+            conf_trigger = f"Пробой подтверждён: закрытие 1H выше {th_long:.2f} ₽ [Pivot {last_ph.price:.2f} + {buffer_val:.2f} (0.10 ATR)]"
 
-        # 4. Приоритет: MIXED / NO TRADE
-        elif senior_trend == "MIXED" and abs(price - ind_1h.ema50) < 0.4 * atr_1h and (45.0 <= ind_1h.rsi14 <= 55.0):
+        # 4. Проверка фильтра флэта / узкой консолидации (MIXED / NO TRADE)
+        elif is_consolidation:
             trade_type = "MIXED / NO TRADE"
-            conf_trigger = "Ожидание выхода из распила и формирования направленного импульса"
+            conf_trigger = f"Узкая консолидация около 1H EMA50 ({ind_1h.ema50:.2f} ₽); ожидание выхода из боковика"
 
-        # 5. Приоритет: Counter Trend
+        # 5. Проверка конфликта старших таймфреймов (1D vs 4H)
+        elif senior_trend == "MIXED" and not (price > ind_1h.ema50 and price >= ind_1h.poc80 and ind_1h.rsi14 >= 50.0):
+            trade_type = "MIXED / NO TRADE"
+            conf_trigger = "Конфликт старших таймфреймов (1D vs 4H) без направленного импульса; сетап заблокирован"
+
+        # 6. Приоритет: Reversal Candidate
+        # Условия: старший тренд BEARISH (или MIXED с явным импульсом), цена восстановилась выше EMA50 и ePOC, RSI >= 45, но пробой пивота ещё не состоялся
+        elif (price > ind_1h.ema50) and (price >= ind_1h.poc80) and (ind_1h.rsi14 >= 45.0) and (senior_trend in ("BEARISH", "MIXED")):
+            trade_type = "Reversal Candidate"
+            dist_to_th = (th_long - price) / atr_1h if th_long else 0.0
+            dist_rub = (th_long - price) if th_long else 0.0
+            conf_trigger = f"Требуется подтверждение: пробой и закрытие часа выше {th_long:.2f} ₽ [Pivot {last_ph.price:.2f} + {buffer_val:.2f} (0.10 ATR)]"
+            reversal_diag = (
+                f"Close {price:.2f} | EMA50 {ind_1h.ema50:.2f} (+{price - ind_1h.ema50:.2f} ₽) | "
+                f"ePOC {ind_1h.poc80:.2f} (+{price - ind_1h.poc80:.2f} ₽) | RSI {ind_1h.rsi14:.1f} | "
+                f"До порога пробоя: {dist_rub:.2f} ₽ ({dist_to_th:.2f} ATR)"
+            )
+
+        # 7. Приоритет: Counter Trend
         else:
             trade_type = "Counter Trend"
-            conf_trigger = f"Спекулятивный подбор; импульсный возврат выше 1H EMA50 ({ind_1h.ema50:.2f} ₽) и POC ({ind_1h.poc80:.2f} ₽)"
+            conf_trigger = f"Спекулятивный лонг против тренда; импульсный возврат выше 1H EMA50 ({ind_1h.ema50:.2f} ₽) и POC ({ind_1h.poc80:.2f} ₽)"
 
     else:  # SHORT
-        # 1. Приоритет: Trend Following
+        breakout_threshold = th_short
+        if bo_short:
+            breakout_status = bo_short.status
+
+        # 1. Приоритет: Trend Following (по старшему тренду)
         if senior_trend == "BEARISH":
             if price <= ind_1h.ema50 or ind_1h.rsi14 <= 60.0:
                 trade_type = "Trend Following"
@@ -144,28 +189,45 @@ def classify_trade_type(
                 trade_type = "Counter Trend"
                 conf_trigger = f"Глубокий откат вверх; уход под 1H EMA50 ({ind_1h.ema50:.2f} ₽)"
 
-        # 2. Приоритет: Confirmed Reversal (при бычьем старшем тренде)
-        elif last_pl and (price < last_pl.price - 0.10 * atr_1h):
+        # 2. Приоритет: Retest Confirmed (пробой с подтверждённым ретестом)
+        elif bo_short and bo_short.status == "Retest Confirmed":
             trade_type = "Confirmed Reversal"
-            conf_trigger = f"Подтверждено: закрытие 1H ниже последнего Pivot Low ({pl_price_str}) с удержанием"
+            conf_trigger = f"Ретест подтверждён: {bo_short.description}"
 
-        # 3. Приоритет: Reversal Candidate
-        elif (price < ind_1h.ema50) and (price <= ind_1h.poc80) and (ind_1h.rsi14 <= 55.0):
-            trade_type = "Reversal Candidate"
-            conf_trigger = f"Пробой и закрытие часа ниже подтверждённого 1H Pivot Low ({pl_price_str})"
+        # 3. Приоритет: Breakout Confirmed (пробой закрытием часовой свечи)
+        elif bo_short and bo_short.status == "Breakout Confirmed":
+            trade_type = "Confirmed Reversal"
+            conf_trigger = f"Пробой подтверждён: закрытие 1H ниже {th_short:.2f} ₽ [Pivot {last_pl.price:.2f} - {buffer_val:.2f} (0.10 ATR)]"
 
-        # 4. Приоритет: MIXED / NO TRADE
-        elif senior_trend == "MIXED" and abs(price - ind_1h.ema50) < 0.4 * atr_1h and (45.0 <= ind_1h.rsi14 <= 55.0):
+        # 4. Проверка фильтра флэта / узкой консолидации (MIXED / NO TRADE)
+        elif is_consolidation:
             trade_type = "MIXED / NO TRADE"
-            conf_trigger = "Ожидание выхода из распила и формирования направленного импульса"
+            conf_trigger = f"Узкая консолидация около 1H EMA50 ({ind_1h.ema50:.2f} ₽); ожидание выхода из боковика"
 
-        # 5. Приоритет: Counter Trend
+        # 5. Проверка конфликта старших таймфреймов (1D vs 4H)
+        elif senior_trend == "MIXED" and not (price < ind_1h.ema50 and price <= ind_1h.poc80 and ind_1h.rsi14 <= 50.0):
+            trade_type = "MIXED / NO TRADE"
+            conf_trigger = "Конфликт старших таймфреймов (1D vs 4H) без направленного импульса; сетап заблокирован"
+
+        # 6. Приоритет: Reversal Candidate
+        elif (price < ind_1h.ema50) and (price <= ind_1h.poc80) and (ind_1h.rsi14 <= 55.0) and (senior_trend in ("BULLISH", "MIXED")):
+            trade_type = "Reversal Candidate"
+            dist_to_th = (price - th_short) / atr_1h if th_short else 0.0
+            dist_rub = (price - th_short) if th_short else 0.0
+            conf_trigger = f"Требуется подтверждение: пробой и закрытие часа ниже {th_short:.2f} ₽ [Pivot {last_pl.price:.2f} - {buffer_val:.2f} (0.10 ATR)]"
+            reversal_diag = (
+                f"Close {price:.2f} | EMA50 {ind_1h.ema50:.2f} (-{ind_1h.ema50 - price:.2f} ₽) | "
+                f"ePOC {ind_1h.poc80:.2f} (-{ind_1h.poc80 - price:.2f} ₽) | RSI {ind_1h.rsi14:.1f} | "
+                f"До порога пробоя: {dist_rub:.2f} ₽ ({dist_to_th:.2f} ATR)"
+            )
+
+        # 7. Приоритет: Counter Trend
         else:
             trade_type = "Counter Trend"
-            conf_trigger = f"Спекулятивный шорт на отскоке; импульсный уход под 1H EMA50 ({ind_1h.ema50:.2f} ₽) и POC ({ind_1h.poc80:.2f} ₽)"
+            conf_trigger = f"Спекулятивный шорт против тренда; импульсный уход под 1H EMA50 ({ind_1h.ema50:.2f} ₽) и POC ({ind_1h.poc80:.2f} ₽)"
 
     inval_trigger = "Закрытие 1H свечи за уровнем Stop-Loss"
-    return trade_type, conf_trigger, inval_trigger
+    return trade_type, conf_trigger, inval_trigger, reversal_diag, breakout_status, breakout_threshold
 
 
 def calculate_structural_entry_2(
@@ -177,86 +239,98 @@ def calculate_structural_entry_2(
 ) -> Tuple[float, str]:
     """
     Рассчитывает Entry_2 на основе структурного рейтинга и конфлюэнции (кластеризации) уровней:
-    - Для LONG: ищет подтверждённые поддержки между anchor_stop и entry_1 (Pivot Low, VAL, EMA50, POC).
-    - Для SHORT: ищет сопротивления между entry_1 и anchor_stop (Pivot High, VAH, EMA50, POC).
-    - При совпадении нескольких уровней (кластер) выбирается центр масс кластера.
-    - При отсутствии структурных кандидатов срабатывает fallback (геометрическая середина).
+    - Для LONG: ищет подтверждённые поддержки между anchor_stop и entry_1 с защитными буферами.
+    - Для SHORT: ищет сопротивления между entry_1 и anchor_stop с защитными буферами.
+    - Соблюдает минимальные буферы: 0.20 ATR от стопа и 0.20 ATR от Entry 1.
+    - Fallback Midpoint также валидируется на соблюдение обоих буферов.
+    - При невозможности безопасного размещения возвращает (0.0, "INVALID_ENTRY_RANGE").
     """
     ind_1h = indicators.get("1H")
     ind_4h = indicators.get("4H")
+
+    min_dist_stop = MIN_DISTANCE_STOP_ATR_MULT * atr_1h
+    min_dist_entry = MIN_DISTANCE_ENTRY_ATR_MULT * atr_1h
+
+    if direction == "LONG":
+        lower_bound = anchor_stop + min_dist_stop
+        upper_bound = entry_1 - min_dist_entry
+    else:
+        lower_bound = entry_1 + min_dist_entry
+        upper_bound = anchor_stop - min_dist_stop
+
+    # Проверяем допустимость диапазона для безопасного размещения второго входа
+    if upper_bound <= lower_bound:
+        return 0.0, "INVALID_ENTRY_RANGE"
+
     fallback_val = 0.5 * (entry_1 + anchor_stop)
     fallback_desc = "Fallback (Midpoint)"
-
-    if not ind_1h:
-        return fallback_val, fallback_desc
+    fallback_is_valid = (lower_bound <= fallback_val <= upper_bound)
 
     candidates: List[Tuple[float, str, float]] = []
 
-    if direction == "LONG":
-        lower_bound = anchor_stop
-        upper_bound = entry_1 - 0.20 * atr_1h
+    if ind_1h:
+        if direction == "LONG":
+            raw_candidates = [
+                (ind_1h.val80, "VAL 70%", 2.5),
+                (ind_1h.swing_low_20, "1H Swing Low", 2.0),
+                (ind_1h.ema50, "1H EMA50", 2.0),
+                (ind_1h.poc80, "1H POC", 1.5),
+            ]
+            if ind_1h.last_pivot_low:
+                raw_candidates.append((ind_1h.last_pivot_low.price, "1H Pivot Low", 2.5))
+            if ind_4h:
+                raw_candidates.append((ind_4h.ema20, "4H EMA20", 1.5))
 
-        if upper_bound <= lower_bound:
-            return fallback_val, fallback_desc
+            for price_lvl, name, weight in raw_candidates:
+                if lower_bound <= price_lvl <= upper_bound:
+                    candidates.append((price_lvl, name, weight))
 
-        raw_candidates = [
-            (ind_1h.val80, "VAL 70%", 2.5),
-            (ind_1h.swing_low_20, "1H Swing Low", 2.0),
-            (ind_1h.ema50, "1H EMA50", 2.0),
-            (ind_1h.poc80, "1H POC", 1.5),
-        ]
-        if ind_1h.last_pivot_low:
-            raw_candidates.append((ind_1h.last_pivot_low.price, "1H Pivot Low", 2.5))
-        if ind_4h:
-            raw_candidates.append((ind_4h.ema20, "4H EMA20", 1.5))
+        else:  # SHORT
+            raw_candidates = [
+                (ind_1h.vah80, "VAH 70%", 2.5),
+                (ind_1h.swing_high_20, "1H Swing High", 2.0),
+                (ind_1h.ema50, "1H EMA50", 2.0),
+                (ind_1h.poc80, "1H POC", 1.5),
+            ]
+            if ind_1h.last_pivot_high:
+                raw_candidates.append((ind_1h.last_pivot_high.price, "1H Pivot High", 2.5))
+            if ind_4h:
+                raw_candidates.append((ind_4h.ema20, "4H EMA20", 1.5))
 
-        for price_lvl, name, weight in raw_candidates:
-            if lower_bound < price_lvl <= upper_bound:
-                candidates.append((price_lvl, name, weight))
-
-    else:  # SHORT
-        lower_bound = entry_1 + 0.20 * atr_1h
-        upper_bound = anchor_stop
-
-        if upper_bound <= lower_bound:
-            return fallback_val, fallback_desc
-
-        raw_candidates = [
-            (ind_1h.vah80, "VAH 70%", 2.5),
-            (ind_1h.swing_high_20, "1H Swing High", 2.0),
-            (ind_1h.ema50, "1H EMA50", 2.0),
-            (ind_1h.poc80, "1H POC", 1.5),
-        ]
-        if ind_1h.last_pivot_high:
-            raw_candidates.append((ind_1h.last_pivot_high.price, "1H Pivot High", 2.5))
-        if ind_4h:
-            raw_candidates.append((ind_4h.ema20, "4H EMA20", 1.5))
-
-        for price_lvl, name, weight in raw_candidates:
-            if lower_bound <= price_lvl < upper_bound:
-                candidates.append((price_lvl, name, weight))
+            for price_lvl, name, weight in raw_candidates:
+                if lower_bound <= price_lvl <= upper_bound:
+                    candidates.append((price_lvl, name, weight))
 
     if not candidates:
-        return fallback_val, fallback_desc
+        if fallback_is_valid:
+            return fallback_val, fallback_desc
+        return 0.0, "INVALID_ENTRY_RANGE"
 
     cluster_radius = 0.35 * atr_1h
     best_score = -1.0
-    best_price = fallback_val
-    best_desc = fallback_desc
+    best_price = fallback_val if fallback_is_valid else 0.0
+    best_desc = fallback_desc if fallback_is_valid else "INVALID_ENTRY_RANGE"
 
     for i, (p_i, name_i, w_i) in enumerate(candidates):
         in_cluster = [c for c in candidates if abs(c[0] - p_i) <= cluster_radius]
         total_weight = sum(c[2] for c in in_cluster)
         cluster_price = sum(c[0] * c[2] for c in in_cluster) / total_weight
 
-        if total_weight > best_score:
-            best_score = total_weight
-            best_price = cluster_price
-            if len(in_cluster) > 1:
-                names = " + ".join(list(dict.fromkeys(c[1] for c in in_cluster)))
-                best_desc = f"Cluster ({names})"
-            else:
-                best_desc = in_cluster[0][1]
+        # Кластерная цена обязана укладываться в [lower_bound, upper_bound]
+        if lower_bound <= cluster_price <= upper_bound:
+            if total_weight > best_score:
+                best_score = total_weight
+                best_price = cluster_price
+                if len(in_cluster) > 1:
+                    names = " + ".join(list(dict.fromkeys(c[1] for c in in_cluster)))
+                    best_desc = f"Cluster ({names})"
+                else:
+                    best_desc = in_cluster[0][1]
+
+    if best_score < 0:
+        if fallback_is_valid:
+            return fallback_val, fallback_desc
+        return 0.0, "INVALID_ENTRY_RANGE"
 
     return best_price, best_desc
 
@@ -293,11 +367,34 @@ def calculate_setup(
     lot = instrument.lot
 
     senior_trend = get_senior_trend(indicators)
-    trade_type, conf_trigger, inval_trigger_desc = classify_trade_type(direction, indicators, senior_trend)
+    trade_type, conf_trigger, inval_trigger_desc, reversal_diag, breakout_status, breakout_threshold = classify_trade_type(
+        direction, indicators, senior_trend
+    )
 
     last_ph_val = ind_1h.last_pivot_high.price if ind_1h.last_pivot_high else None
     last_pl_val = ind_1h.last_pivot_low.price if ind_1h.last_pivot_low else None
     market_structure_1h = ind_1h.market_structure
+
+    # Синхронизация порога с шагом инструмента (min_price_increment)
+    if breakout_threshold is not None:
+        breakout_threshold = round_to_step(breakout_threshold, step)
+        th_fmt = format_price(breakout_threshold, step)
+        buf_val = BREAKOUT_BUFFER_ATR_MULT * atr_1h
+        buf_fmt = format_price(buf_val, step)
+        if trade_type == "Confirmed Reversal" and breakout_status == "Breakout Confirmed":
+            if direction == "LONG" and last_ph_val:
+                ph_fmt = format_price(last_ph_val, step)
+                conf_trigger = f"Пробой подтверждён: закрытие 1H выше {th_fmt} ₽ [Pivot {ph_fmt} + {buf_fmt} (0.10 ATR)]"
+            elif direction == "SHORT" and last_pl_val:
+                pl_fmt = format_price(last_pl_val, step)
+                conf_trigger = f"Пробой подтверждён: закрытие 1H ниже {th_fmt} ₽ [Pivot {pl_fmt} - {buf_fmt} (0.10 ATR)]"
+        elif trade_type == "Reversal Candidate":
+            if direction == "LONG" and last_ph_val:
+                ph_fmt = format_price(last_ph_val, step)
+                conf_trigger = f"Требуется подтверждение: пробой и закрытие часа выше {th_fmt} ₽ [Pivot {ph_fmt} + {buf_fmt} (0.10 ATR)]"
+            elif direction == "SHORT" and last_pl_val:
+                pl_fmt = format_price(last_pl_val, step)
+                conf_trigger = f"Требуется подтверждение: пробой и закрытие часа ниже {th_fmt} ₽ [Pivot {pl_fmt} - {buf_fmt} (0.10 ATR)]"
 
     # Предупреждения
     warnings = []
@@ -306,7 +403,10 @@ def calculate_setup(
     elif trade_type == "Reversal Candidate":
         warnings.append("ИНФО: КАНДИДАТ В РАЗВОРОТ (Reversal Candidate 1H — требуется подтверждение)")
     elif trade_type == "Confirmed Reversal":
-        warnings.append("СИЛЬНЫЙ СИГНАЛ: ПОДТВЕРЖДЁННЫЙ СЛОМ СТРУКТУРЫ (Confirmed Reversal 1H)")
+        if breakout_status == "Retest Confirmed":
+            warnings.append("СИЛЬНЕЙШИЙ СИГНАЛ: РЕТЕСТ ПОДТВЕРЖДЁН (Retest Confirmed 1H)")
+        else:
+            warnings.append("СИЛЬНЫЙ СИГНАЛ: ПРОБОЙ СТРУКТУРЫ ПОДТВЕРЖДЁН (Breakout Confirmed 1H)")
     elif trade_type == "MIXED / NO TRADE":
         warnings.append("НЕОПРЕДЕЛЁННОСТЬ: РЫНОК В СМЕШАННОМ РЕЖИМЕ (Mixed Structure)")
 
@@ -344,6 +444,16 @@ def calculate_setup(
             atr_1h=atr_1h,
             indicators=indicators
         )
+
+        if entry_2_source == "INVALID_ENTRY_RANGE" or entry_2 <= 0.0:
+            return _make_skip_result(
+                instrument, direction, current_price, senior_trend,
+                reason=f"Диапазон входа слишком узок (< {MIN_DISTANCE_STOP_ATR_MULT + MIN_DISTANCE_ENTRY_ATR_MULT:.2f} ATR между Entry 1 и Stop). Размещение Entry 2 небезопасно.",
+                trade_type=trade_type,
+                last_ph=last_ph_val, last_pl=last_pl_val, market_structure_1h=market_structure_1h,
+                conf_trigger=conf_trigger, inval_trigger=inval_trigger_desc,
+                reversal_diagnostics=reversal_diag, breakout_status=breakout_status, breakout_threshold=breakout_threshold
+            )
 
         stop = anchor_stop + 0.6 * atr_1h
 
@@ -443,6 +553,16 @@ def calculate_setup(
             atr_1h=atr_1h,
             indicators=indicators
         )
+
+        if entry_2_source == "INVALID_ENTRY_RANGE" or entry_2 <= 0.0:
+            return _make_skip_result(
+                instrument, direction, current_price, senior_trend,
+                reason=f"Диапазон входа слишком узок (< {MIN_DISTANCE_STOP_ATR_MULT + MIN_DISTANCE_ENTRY_ATR_MULT:.2f} ATR между Entry 1 и Stop). Размещение Entry 2 небезопасно.",
+                trade_type=trade_type,
+                last_ph=last_ph_val, last_pl=last_pl_val, market_structure_1h=market_structure_1h,
+                conf_trigger=conf_trigger, inval_trigger=inval_trigger_desc,
+                reversal_diagnostics=reversal_diag, breakout_status=breakout_status, breakout_threshold=breakout_threshold
+            )
 
         stop = anchor_stop - 0.6 * atr_1h
 
@@ -677,7 +797,10 @@ def calculate_setup(
         step=step,
         lot_size=lot,
         skip_reason=skip_reason,
-        warning=warning
+        warning=warning,
+        reversal_diagnostics=reversal_diag,
+        breakout_status=breakout_status,
+        breakout_threshold=breakout_threshold
     )
 
 
@@ -692,7 +815,10 @@ def _make_skip_result(
     last_pl: Optional[float] = None,
     market_structure_1h: str = "Undefined",
     conf_trigger: str = "—",
-    inval_trigger: str = "—"
+    inval_trigger: str = "—",
+    reversal_diagnostics: Optional[str] = None,
+    breakout_status: Optional[str] = None,
+    breakout_threshold: Optional[float] = None
 ) -> SetupResult:
     """Создаёт результат со статусом SKIP при невозможности построения сетапа."""
     return SetupResult(
@@ -737,5 +863,8 @@ def _make_skip_result(
         total_profit_rub=0.0,
         step=instrument.min_price_increment,
         lot_size=instrument.lot,
-        skip_reason=reason
+        skip_reason=reason,
+        reversal_diagnostics=reversal_diagnostics,
+        breakout_status=breakout_status,
+        breakout_threshold=breakout_threshold
     )

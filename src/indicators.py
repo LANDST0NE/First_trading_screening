@@ -3,6 +3,12 @@ from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 import pandas as pd
 
+from src.config import (
+    BREAKOUT_BUFFER_ATR_MULT,
+    RETEST_WINDOW_BARS,
+    RETEST_ZONE_PENETRATION_MULT
+)
+
 
 @dataclass
 class PivotPoint:
@@ -12,6 +18,18 @@ class PivotPoint:
     formation_time: Any
     confirmation_time: Any
     is_high: bool
+
+
+@dataclass
+class BreakoutRetestInfo:
+    direction: str              # "LONG" или "SHORT"
+    pivot_price: float
+    buffer: float
+    threshold: float
+    status: str                 # "None", "Breakout Confirmed", "Retest Confirmed", "Testing / Wick"
+    bars_since_breakout: int    # Число закрытых баров с момента пробоя
+    retest_candle_idx: Optional[int]
+    description: str
 
 
 @dataclass
@@ -31,6 +49,10 @@ class TFIndicators:
     market_structure: str
     close: float
     candles_count: int
+    last_closed_close: float = 0.0
+    is_last_candle_closed: bool = True
+    breakout_info_long: Optional[BreakoutRetestInfo] = None
+    breakout_info_short: Optional[BreakoutRetestInfo] = None
 
 
 def calculate_ema(series: pd.Series, span: int) -> pd.Series:
@@ -262,11 +284,14 @@ def evaluate_market_structure(
     last_pl = pivot_lows[-1]
     last_close = float(df["close"].iloc[-1])
 
+    th_long = last_ph.price + BREAKOUT_BUFFER_ATR_MULT * atr
+    th_short = last_pl.price - BREAKOUT_BUFFER_ATR_MULT * atr
+
     # Проверка пробоя структуры на последней закрытой свече
-    if last_close > last_ph.price + 0.1 * atr:
-        return f"Bullish Breakout (выше {last_ph.price:.2f})"
-    elif last_close < last_pl.price - 0.1 * atr:
-        return f"Bearish Breakdown (ниже {last_pl.price:.2f})"
+    if last_close > th_long:
+        return f"Bullish Breakout (порог {th_long:.2f} ₽ [Pivot {last_ph.price:.2f} + 0.1 ATR])"
+    elif last_close < th_short:
+        return f"Bearish Breakdown (порог {th_short:.2f} ₽ [Pivot {last_pl.price:.2f} - 0.1 ATR])"
 
     # Сравнение последних двух пивотов
     if len(pivot_highs) >= 2 and len(pivot_lows) >= 2:
@@ -289,26 +314,284 @@ def evaluate_market_structure(
 
     # Если пивотов мало
     if last_close > last_ph.price:
-        return "Breakout Testing"
+        return f"Breakout Testing (Close {last_close:.2f} выше Pivot {last_ph.price:.2f}, но ниже порога {th_long:.2f})"
     elif last_close < last_pl.price:
-        return "Breakdown Testing"
+        return f"Breakdown Testing (Close {last_close:.2f} ниже Pivot {last_pl.price:.2f}, но выше порога {th_short:.2f})"
 
     return "Range / Neutral"
 
 
+def check_breakout_and_retest(
+    df_closed: pd.DataFrame,
+    pivot_highs: List[PivotPoint],
+    pivot_lows: List[PivotPoint],
+    atr: float
+) -> Tuple[BreakoutRetestInfo, BreakoutRetestInfo]:
+    """
+    Проверяет статус пробоя и ретеста относительно последних подтверждённых Pivot High / Low.
+    Возвращает (BreakoutRetestInfo для LONG, BreakoutRetestInfo для SHORT).
+    """
+    n = len(df_closed)
+    last_candle = df_closed.iloc[-1]
+    last_close = float(last_candle["close"])
+
+    # 1. LONG АНАЛИЗ (пробой Pivot High)
+    last_ph = pivot_highs[-1] if pivot_highs else None
+    if not last_ph:
+        long_info = BreakoutRetestInfo(
+            direction="LONG",
+            pivot_price=0.0,
+            buffer=0.0,
+            threshold=0.0,
+            status="None",
+            bars_since_breakout=0,
+            retest_candle_idx=None,
+            description="Подтверждённый 1H Pivot High отсутствует"
+        )
+    else:
+        buffer_long = BREAKOUT_BUFFER_ATR_MULT * atr
+        threshold_long = last_ph.price + buffer_long
+        start_idx = max(last_ph.confirmation_idx, 0)
+
+        # Ищем первую свечу пробоя после момента подтверждения пивота
+        breakout_idx = None
+        for i in range(start_idx, n):
+            if float(df_closed.iloc[i]["close"]) > threshold_long:
+                breakout_idx = i
+                break
+
+        if breakout_idx is None:
+            # Пробоя закрытием не было. Проверяем касание/прокол тенью
+            if float(last_candle["high"]) > last_ph.price:
+                long_info = BreakoutRetestInfo(
+                    direction="LONG",
+                    pivot_price=last_ph.price,
+                    buffer=buffer_long,
+                    threshold=threshold_long,
+                    status="Testing / Wick",
+                    bars_since_breakout=0,
+                    retest_candle_idx=None,
+                    description=f"Касание/тень (High {float(last_candle['high']):.2f} > Pivot {last_ph.price:.2f}, но Close {last_close:.2f} <= порога {threshold_long:.2f})"
+                )
+            else:
+                long_info = BreakoutRetestInfo(
+                    direction="LONG",
+                    pivot_price=last_ph.price,
+                    buffer=buffer_long,
+                    threshold=threshold_long,
+                    status="None",
+                    bars_since_breakout=0,
+                    retest_candle_idx=None,
+                    description=f"Ниже порога пробоя ({threshold_long:.2f} ₽)"
+                )
+        else:
+            bars_since = (n - 1) - breakout_idx
+            # Проверяем, не было ли возврата глубоко под пивот (инвалидация)
+            is_invalidated = False
+            for chk in range(breakout_idx + 1, n):
+                if float(df_closed.iloc[chk]["close"]) < last_ph.price - 0.20 * atr:
+                    is_invalidated = True
+                    break
+
+            if is_invalidated:
+                long_info = BreakoutRetestInfo(
+                    direction="LONG",
+                    pivot_price=last_ph.price,
+                    buffer=buffer_long,
+                    threshold=threshold_long,
+                    status="None",
+                    bars_since_breakout=bars_since,
+                    retest_candle_idx=None,
+                    description=f"Ложный пробой: цена вернулась под Pivot High ({last_ph.price:.2f} ₽)"
+                )
+            elif bars_since == 0:
+                long_info = BreakoutRetestInfo(
+                    direction="LONG",
+                    pivot_price=last_ph.price,
+                    buffer=buffer_long,
+                    threshold=threshold_long,
+                    status="Breakout Confirmed",
+                    bars_since_breakout=0,
+                    retest_candle_idx=None,
+                    description=f"Пробой подтверждён на последней свече (Close {last_close:.2f} > {threshold_long:.2f} ₽). Ретест ещё не сформирован."
+                )
+            else:
+                # Проверяем ретест в окне наблюдения (до RETEST_WINDOW_BARS закрытых свечей после пробоя)
+                retest_idx = None
+                zone_bottom = last_ph.price - RETEST_ZONE_PENETRATION_MULT * atr
+                zone_top = last_ph.price + 0.20 * atr
+
+                for chk in range(breakout_idx + 1, min(breakout_idx + RETEST_WINDOW_BARS + 1, n)):
+                    bar = df_closed.iloc[chk]
+                    bar_low = float(bar["low"])
+                    bar_close = float(bar["close"])
+                    if zone_bottom <= bar_low <= zone_top and bar_close > last_ph.price:
+                        retest_idx = chk
+                        break
+
+                if retest_idx is not None:
+                    long_info = BreakoutRetestInfo(
+                        direction="LONG",
+                        pivot_price=last_ph.price,
+                        buffer=buffer_long,
+                        threshold=threshold_long,
+                        status="Retest Confirmed",
+                        bars_since_breakout=bars_since,
+                        retest_candle_idx=retest_idx,
+                        description=f"Ретест подтверждён (свеча #{retest_idx} протестировала уровень {last_ph.price:.2f} ₽ сверху и закрылась выше)"
+                    )
+                else:
+                    long_info = BreakoutRetestInfo(
+                        direction="LONG",
+                        pivot_price=last_ph.price,
+                        buffer=buffer_long,
+                        threshold=threshold_long,
+                        status="Breakout Confirmed",
+                        bars_since_breakout=bars_since,
+                        retest_candle_idx=None,
+                        description=f"Пробой подтверждён {bars_since} св. назад (порог {threshold_long:.2f} ₽). Окно ретеста активно/истекло, ретест не зафиксирован."
+                    )
+
+    # 2. SHORT АНАЛИЗ (пробой Pivot Low)
+    last_pl = pivot_lows[-1] if pivot_lows else None
+    if not last_pl:
+        short_info = BreakoutRetestInfo(
+            direction="SHORT",
+            pivot_price=0.0,
+            buffer=0.0,
+            threshold=0.0,
+            status="None",
+            bars_since_breakout=0,
+            retest_candle_idx=None,
+            description="Подтверждённый 1H Pivot Low отсутствует"
+        )
+    else:
+        buffer_short = BREAKOUT_BUFFER_ATR_MULT * atr
+        threshold_short = last_pl.price - buffer_short
+        start_idx = max(last_pl.confirmation_idx, 0)
+
+        breakout_idx_s = None
+        for i in range(start_idx, n):
+            if float(df_closed.iloc[i]["close"]) < threshold_short:
+                breakout_idx_s = i
+                break
+
+        if breakout_idx_s is None:
+            if float(last_candle["low"]) < last_pl.price:
+                short_info = BreakoutRetestInfo(
+                    direction="SHORT",
+                    pivot_price=last_pl.price,
+                    buffer=buffer_short,
+                    threshold=threshold_short,
+                    status="Testing / Wick",
+                    bars_since_breakout=0,
+                    retest_candle_idx=None,
+                    description=f"Касание/тень (Low {float(last_candle['low']):.2f} < Pivot {last_pl.price:.2f}, но Close {last_close:.2f} >= порога {threshold_short:.2f})"
+                )
+            else:
+                short_info = BreakoutRetestInfo(
+                    direction="SHORT",
+                    pivot_price=last_pl.price,
+                    buffer=buffer_short,
+                    threshold=threshold_short,
+                    status="None",
+                    bars_since_breakout=0,
+                    retest_candle_idx=None,
+                    description=f"Выше порога пробоя ({threshold_short:.2f} ₽)"
+                )
+        else:
+            bars_since_s = (n - 1) - breakout_idx_s
+            is_invalidated_s = False
+            for chk in range(breakout_idx_s + 1, n):
+                if float(df_closed.iloc[chk]["close"]) > last_pl.price + 0.20 * atr:
+                    is_invalidated_s = True
+                    break
+
+            if is_invalidated_s:
+                short_info = BreakoutRetestInfo(
+                    direction="SHORT",
+                    pivot_price=last_pl.price,
+                    buffer=buffer_short,
+                    threshold=threshold_short,
+                    status="None",
+                    bars_since_breakout=bars_since_s,
+                    retest_candle_idx=None,
+                    description=f"Ложный пробой: цена вернулась над Pivot Low ({last_pl.price:.2f} ₽)"
+                )
+            elif bars_since_s == 0:
+                short_info = BreakoutRetestInfo(
+                    direction="SHORT",
+                    pivot_price=last_pl.price,
+                    buffer=buffer_short,
+                    threshold=threshold_short,
+                    status="Breakout Confirmed",
+                    bars_since_breakout=0,
+                    retest_candle_idx=None,
+                    description=f"Пробой подтверждён на последней свече (Close {last_close:.2f} < {threshold_short:.2f} ₽). Ретест ещё не сформирован."
+                )
+            else:
+                retest_idx_s = None
+                zone_top_s = last_pl.price + RETEST_ZONE_PENETRATION_MULT * atr
+                zone_bottom_s = last_pl.price - 0.20 * atr
+
+                for chk in range(breakout_idx_s + 1, min(breakout_idx_s + RETEST_WINDOW_BARS + 1, n)):
+                    bar = df_closed.iloc[chk]
+                    bar_high = float(bar["high"])
+                    bar_close = float(bar["close"])
+                    if zone_bottom_s <= bar_high <= zone_top_s and bar_close < last_pl.price:
+                        retest_idx_s = chk
+                        break
+
+                if retest_idx_s is not None:
+                    short_info = BreakoutRetestInfo(
+                        direction="SHORT",
+                        pivot_price=last_pl.price,
+                        buffer=buffer_short,
+                        threshold=threshold_short,
+                        status="Retest Confirmed",
+                        bars_since_breakout=bars_since_s,
+                        retest_candle_idx=retest_idx_s,
+                        description=f"Ретест подтверждён (свеча #{retest_idx_s} протестировала уровень {last_pl.price:.2f} ₽ снизу и закрылась ниже)"
+                    )
+                else:
+                    short_info = BreakoutRetestInfo(
+                        direction="SHORT",
+                        pivot_price=last_pl.price,
+                        buffer=buffer_short,
+                        threshold=threshold_short,
+                        status="Breakout Confirmed",
+                        bars_since_breakout=bars_since_s,
+                        retest_candle_idx=None,
+                        description=f"Пробой подтверждён {bars_since_s} св. назад (порог {threshold_short:.2f} ₽). Окно ретеста активно/истекло, ретест не зафиксирован."
+                    )
+
+    return long_info, short_info
+
+
 def calculate_tf_indicators(df: pd.DataFrame, tf_name: str) -> Optional[TFIndicators]:
-    """Рассчитывает полный пакет индикаторов для одного таймфрейма."""
+    """Рассчитывает полный пакет индикаторов для одного таймфрейма строго на закрытых свечах."""
     if df.empty or len(df) < 50:
         return None
 
-    df_calc = df.copy()
+    # Фильтрация незакрытых свечей
+    if "is_complete" in df.columns:
+        df_closed = df[df["is_complete"] == True].copy()
+        if len(df_closed) < 50:
+            df_closed = df.copy()
+        is_last_closed = bool(df["is_complete"].iloc[-1])
+    else:
+        df_closed = df.copy()
+        is_last_closed = True
+
+    df_calc = df_closed.copy()
     df_calc["ema20"] = calculate_ema(df_calc["close"], span=20)
     df_calc["ema50"] = calculate_ema(df_calc["close"], span=50)
     df_calc["atr14"] = calculate_atr(df_calc, period=14)
     df_calc["rsi14"] = calculate_rsi(df_calc, period=14)
 
     last_row = df_calc.iloc[-1]
-    last_close = float(last_row["close"])
+    last_closed_close = float(last_row["close"])
+    live_close = float(df["close"].iloc[-1])
     atr14 = float(last_row["atr14"])
 
     poc80, val80, vah80 = calculate_vpvr(df_calc, lookback=80, num_bins=60, va_pct=0.70)
@@ -323,8 +606,9 @@ def calculate_tf_indicators(df: pd.DataFrame, tf_name: str) -> Optional[TFIndica
     last_ph = pivot_highs[-1] if pivot_highs else None
     last_pl = pivot_lows[-1] if pivot_lows else None
 
-    # Оценка структуры рынка
+    # Оценка структуры рынка и статусов пробоя / ретеста
     market_structure = evaluate_market_structure(df_calc, pivot_highs, pivot_lows, atr14)
+    bo_long, bo_short = check_breakout_and_retest(df_calc, pivot_highs, pivot_lows, atr14)
 
     return TFIndicators(
         tf=tf_name,
@@ -340,8 +624,12 @@ def calculate_tf_indicators(df: pd.DataFrame, tf_name: str) -> Optional[TFIndica
         last_pivot_high=last_ph,
         last_pivot_low=last_pl,
         market_structure=market_structure,
-        close=last_close,
-        candles_count=len(df_calc)
+        close=live_close,
+        candles_count=len(df_calc),
+        last_closed_close=last_closed_close,
+        is_last_candle_closed=is_last_closed,
+        breakout_info_long=bo_long,
+        breakout_info_short=bo_short
     )
 
 
