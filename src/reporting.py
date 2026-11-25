@@ -16,9 +16,13 @@ console = Console()
 def _get_trade_type_style(trade_type: str) -> str:
     if "Following" in trade_type:
         return "bold green"
-    elif "Reversal" in trade_type:
+    elif "Confirmed Reversal" in trade_type:
+        return "bold magenta"
+    elif "Candidate" in trade_type:
         return "bold cyan"
-    return "bold yellow"
+    elif "MIXED" in trade_type:
+        return "bold red"
+    return "yellow"
 
 
 def print_single_report(
@@ -51,16 +55,21 @@ def print_single_report(
     console.print()
     console.print(Panel(header_text, title="АНАЛИЗ АКЦИИ", border_style="cyan"))
 
-    # 2. Таблица индикаторов
-    table_ind = Table(title="Технические индикаторы по таймфреймам", header_style="bold yellow")
+    # 2. Таблица индикаторов с eVPVR
+    table_ind = Table(
+        title="Технические индикаторы и eVPVR (Estimated Volume Profile)",
+        caption="* eVPVR — приближённый профиль объёма, рассчитанный распределением OHLCV-объёма по корзинам.",
+        caption_style="dim italic",
+        header_style="bold yellow"
+    )
     table_ind.add_column("ТФ", justify="center")
     table_ind.add_column("EMA 20", justify="right")
     table_ind.add_column("EMA 50", justify="right")
     table_ind.add_column("ATR(14)", justify="right")
     table_ind.add_column("RSI(14)", justify="right")
-    table_ind.add_column("POC(80)", justify="right")
-    table_ind.add_column("VAL 70%", justify="right")
-    table_ind.add_column("VAH 70%", justify="right")
+    table_ind.add_column("ePOC(80)", justify="right")
+    table_ind.add_column("eVAL 70%", justify="right")
+    table_ind.add_column("eVAH 70%", justify="right")
     table_ind.add_column("Swing Low", justify="right")
     table_ind.add_column("Swing High", justify="right")
 
@@ -83,7 +92,28 @@ def print_single_report(
 
     console.print(table_ind)
 
-    # 3. Торговый билет / Сетап
+    # 3. Блок: Качество сетапа и триггеры подтверждения
+    ph_str = f"{format_price(setup.last_pivot_high, step)} ₽" if setup.last_pivot_high else "Не сформирован"
+    pl_str = f"{format_price(setup.last_pivot_low, step)} ₽" if setup.last_pivot_low else "Не сформирован"
+
+    quality_table = Table(show_header=False, box=None, padding=(0, 2))
+    quality_table.add_column("Параметр", style="bold")
+    quality_table.add_column("Значение")
+
+    quality_table.add_row("Старший тренд (1D/4H):", Text(setup.senior_trend, style=trend_style))
+    quality_table.add_row("Часовая структура (1H):", Text(setup.market_structure_1h, style="cyan"))
+    quality_table.add_row("Последний Pivot High (L=3, R=2):", ph_str)
+    quality_table.add_row("Последний Pivot Low (L=3, R=2):", pl_str)
+    quality_table.add_row(
+        "Классификация сделки:",
+        Text(setup.trade_type, style=_get_trade_type_style(setup.trade_type))
+    )
+    quality_table.add_row("Условие подтверждения:", Text(setup.confirmation_trigger, style="bold green"))
+    quality_table.add_row("Условие отмены сценария:", Text(setup.invalidation_trigger, style="bold red"))
+
+    console.print(Panel(quality_table, title="СТРУКТУРНЫЙ АНАЛИЗ И ВАЛИДАЦИЯ СЕТАПА", border_style="blue"))
+
+    # 4. Торговый билет / Сетап
     status_style = "bold green" if "ACTIVE (Strong)" in setup.status else (
         "bold yellow" if "ACTIVE (Standard)" in setup.status else "bold red"
     )
@@ -93,7 +123,6 @@ def print_single_report(
     ticket_table.add_column("Значение")
 
     ticket_table.add_row("Направление сделки:", Text(setup.direction, style="bold cyan"))
-    ticket_table.add_row("Тип сделки (Классификация):", Text(setup.trade_type, style=_get_trade_type_style(setup.trade_type)))
     ticket_table.add_row("Статус сетапа:", Text(setup.status, style=status_style))
 
     if setup.warning:
@@ -159,19 +188,33 @@ def export_single_markdown(
         sign = "+" if chg > 0 else ""
         imoex_str = f"{imoex_info['price']:.2f} ({sign}{chg:.2f}%) [{imoex_info['trend']}]"
 
+    ph_str = f"{format_price(setup.last_pivot_high, step)} ₽" if setup.last_pivot_high else "Не сформирован"
+    pl_str = f"{format_price(setup.last_pivot_low, step)} ₽" if setup.last_pivot_low else "Не сформирован"
+
     md = []
     md.append(f"# Торговый отчёт по акции {instrument.ticker} ({instrument.name})")
     md.append(f"- **Текущая цена:** {format_price(setup.current_price, step)} ₽")
     md.append(f"- **Размер лота:** {instrument.lot} шт.")
     md.append(f"- **Шорт у брокера:** {'Доступен' if instrument.short_enabled_flag else 'Запрещён'}")
     md.append(f"- **Господствующий тренд (1D/4H):** `{setup.senior_trend}`")
-    md.append(f"- **Тип сделки (Классификация):** `{setup.trade_type}`")
     md.append(f"- **Фон индекса IMOEX:** {imoex_str}")
     md.append("")
 
+    # Структурный анализ рынка и валидация
+    md.append("## Структурный анализ рынка (1H Structure & Pivots)")
+    md.append(f"- **Классификация сделки:** `{setup.trade_type}`")
+    md.append(f"- **Часовая структура:** `{setup.market_structure_1h}`")
+    md.append(f"- **Последний подтверждённый Pivot High (L=3, R=2):** `{ph_str}`")
+    md.append(f"- **Последний подтверждённый Pivot Low (L=3, R=2):** `{pl_str}`")
+    md.append(f"- **Условие подтверждения сценария:** {setup.confirmation_trigger}")
+    md.append(f"- **Условие отмены сценария (Invalidation):** `{setup.invalidation_trigger}`")
+    md.append("")
+
     # Таблица индикаторов
-    md.append("## Технические индикаторы")
-    md.append("| ТФ | EMA 20 | EMA 50 | ATR(14) | RSI(14) | POC(80) | VAL 70% | VAH 70% | Swing Low | Swing High |")
+    md.append("## Технические индикаторы и eVPVR")
+    md.append("> *Примечание:* eVPVR (Estimated Volume Profile) — оценочное приближение профиля объёма, полученное распределением объёма OHLCV-свечей по ценовым корзинам.")
+    md.append("")
+    md.append("| ТФ | EMA 20 | EMA 50 | ATR(14) | RSI(14) | ePOC(80) | eVAL 70% | eVAH 70% | Swing Low | Swing High |")
     md.append("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     for tf in ["1H", "4H", "1D"]:
         if tf in indicators:
@@ -186,7 +229,6 @@ def export_single_markdown(
 
     # Сетап
     md.append(f"## Торговый план ({setup.direction})")
-    md.append(f"- **Классификация сделки:** `{setup.trade_type}`")
     md.append(f"- **Статус сетапа:** `{setup.status}`")
     if setup.warning:
         md.append(f"- **Предупреждение:** `{setup.warning}`")
@@ -289,11 +331,16 @@ def print_screener_summary(
             border_col = "bold green" if i == 0 else ("cyan" if i == 1 else "yellow")
 
             warn_line = f"\n[bold red on yellow]Предупреждение: {s.warning}[/bold red on yellow]" if s.warning else ""
+            triggers_line = (
+                f"\n[bold blue]Часовая структура:[/] {s.market_structure_1h}\n"
+                f"[bold green]Подтверждение:[/] {s.confirmation_trigger}\n"
+                f"[bold red]Отмена сценария:[/] {s.invalidation_trigger}"
+            )
 
             if s.total_lots > 0:
                 card_text = (
                     f"[bold]{medal}: {s.ticker} ({s.direction})[/bold]  |  Тип: [{_get_trade_type_style(s.trade_type)}]{s.trade_type}[/]  |  Тренд 1D/4H: {s.senior_trend}\n"
-                    f"R/R (средневзвеш.): [bold green]{s.rr:.2f}[/bold green]  |  Статус: {s.status}{warn_line}\n"
+                    f"R/R (средневзвеш.): [bold green]{s.rr:.2f}[/bold green]  |  Статус: {s.status}{warn_line}{triggers_line}\n"
                     f"Вход 1 (50%): {format_price(s.entry_1, s.step)} ₽ [{s.lots_entry_1} лот.]  |  "
                     f"Вход 2 (50% добор): {format_price(s.entry_2, s.step)} ₽ [{s.lots_entry_2} лот.]  (Опора: [cyan]{s.entry_2_source}[/cyan])\n"
                     f"Средний вход: {format_price(s.entry_avg, s.step)} ₽  |  "
@@ -307,7 +354,7 @@ def print_screener_summary(
                 ideal_str = f"  |  Идеальный вход: {format_price(s.ideal_entry, s.step)} ₽" if s.ideal_entry else ""
                 card_text = (
                     f"[bold]{medal}: {s.ticker} ({s.direction})[/bold]  |  Тип: [{_get_trade_type_style(s.trade_type)}]{s.trade_type}[/]  |  Тренд 1D/4H: {s.senior_trend}\n"
-                    f"R/R: {s.rr:.2f}  |  Статус: [red]{s.status}[/red]{warn_line}\n"
+                    f"R/R: {s.rr:.2f}  |  Статус: [red]{s.status}[/red]{warn_line}{triggers_line}\n"
                     f"Причина пропуска: {s.skip_reason or 'R/R ниже порога'}{ideal_str}"
                 )
             console.print(Panel(card_text, border_style=border_col))
@@ -341,12 +388,17 @@ def export_screener_markdown(
 
     # Статистика по типам сделок
     tf_count = sum(1 for s in results if s.trade_type == "Trend Following" and s.total_lots > 0)
-    tr_count = sum(1 for s in results if s.trade_type == "Trend Reversal" and s.total_lots > 0)
+    cr_count = sum(1 for s in results if s.trade_type == "Confirmed Reversal" and s.total_lots > 0)
+    rc_count = sum(1 for s in results if s.trade_type == "Reversal Candidate" and s.total_lots > 0)
     ct_count = sum(1 for s in results if s.trade_type == "Counter Trend" and s.total_lots > 0)
-    md.append("## Статистика активных сделок по режимам")
-    md.append(f"- 📈 **Trend Following (по тренду):** {tf_count}")
-    md.append(f"- 🔄 **Trend Reversal (разворот 1H):** {tr_count}")
+    mx_count = sum(1 for s in results if "MIXED" in s.trade_type)
+    md.append("## Статистика активных сделок по режимам структуры")
+    md.append(f"- 📈 **Trend Following (по старшему тренду):** {tf_count}")
+    md.append(f"- 🚀 **Confirmed Reversal (подтверждённый слом структуры):** {cr_count}")
+    md.append(f"- 🔄 **Reversal Candidate (кандидат в разворот 1H):** {rc_count}")
     md.append(f"- ⚡ **Counter Trend (контртренд):** {ct_count}")
+    if mx_count > 0:
+        md.append(f"- ⚠️ **MIXED / NO TRADE (рынок в распиле):** {mx_count}")
     md.append("")
 
     if top_setups:
@@ -355,9 +407,16 @@ def export_screener_markdown(
         for i, s in enumerate(top_setups):
             medal = medals[i] if i < len(medals) else f"TOP-{i+1}"
             step = s.step
+            ph_str = f"{format_price(s.last_pivot_high, step)} ₽" if s.last_pivot_high else "—"
+            pl_str = f"{format_price(s.last_pivot_low, step)} ₽" if s.last_pivot_low else "—"
+
             md.append(f"### {medal}: {s.ticker} ({s.direction})")
-            md.append(f"- **Тип сделки (Классификация):** `{s.trade_type}`")
+            md.append(f"- **Классификация сделки:** `{s.trade_type}`")
             md.append(f"- **Господствующий тренд (1D/4H):** `{s.senior_trend}`")
+            md.append(f"- **Часовая структура:** `{s.market_structure_1h}`")
+            md.append(f"- **Подтверждённый Pivot High:** `{ph_str}` | **Pivot Low:** `{pl_str}`")
+            md.append(f"- **Условие подтверждения:** {s.confirmation_trigger}")
+            md.append(f"- **Условие отмены сценария:** `{s.invalidation_trigger}`")
             md.append(f"- **Статус:** `{s.status}`")
             if s.warning:
                 md.append(f"- **Предупреждение:** `{s.warning}`")
