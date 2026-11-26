@@ -334,6 +334,7 @@ class Backtester:
                 "equity": curr_capital
             })
 
+        self.last_plans = plans
         metrics = MetricsCalculator.calculate(
             plans=plans,
             initial_capital=self.cfg.initial_capital,

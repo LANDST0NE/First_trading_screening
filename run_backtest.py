@@ -82,6 +82,8 @@ def main():
                     direction_pref=direction
                 )
                 ticker_metrics.append((t, m))
+                if hasattr(backtester, "last_plans") and backtester.last_plans:
+                    all_plans.extend(backtester.last_plans)
             except Exception as e:
                 console.print(f"[dim red]Ошибка {t}: {e}[/dim red]")
 
@@ -119,6 +121,38 @@ def main():
         port_wr = (total_wins / total_trades * 100.0) if total_trades > 0 else 0.0
         p_color = "green" if total_net >= 0 else "red"
         console.print(f"\n[bold]ИТОГО по портфелю: Сделок = {total_trades}, Win Rate = {port_wr:.1f}%, Чистый PnL = [{p_color}]{total_net:+,.2f} ₽[/{p_color}][/bold]\n")
+
+        # Дополнительная разбивка по типам сетапов в портфеле
+        if all_plans:
+            port_metrics = MetricsCalculator.calculate(plans=all_plans, initial_capital=args.deposit)
+            if port_metrics.by_trade_type:
+                t_type = Table(title="Разбивка результатов по типам сетапов", header_style="bold cyan")
+                t_type.add_column("Тип сетапа", style="bold")
+                t_type.add_column("Сделки", justify="right")
+                t_type.add_column("Win Rate", justify="right")
+                t_type.add_column("Profit Factor", justify="right")
+                t_type.add_column("Gross Win", justify="right")
+                t_type.add_column("Gross Loss", justify="right")
+                t_type.add_column("Комиссии", justify="right")
+                t_type.add_column("Чистый PnL", justify="right")
+
+                for name, sm in sorted(port_metrics.by_trade_type.items(), key=lambda x: -x[1].executed_plans):
+                    if sm.executed_plans == 0:
+                        continue
+                    p_c = "green" if sm.net_profit >= 0 else "red"
+                    pf_str = f"{sm.profit_factor:.2f}" if sm.profit_factor < 100 else "N/A"
+                    t_type.add_row(
+                        name,
+                        str(sm.executed_plans),
+                        f"{sm.win_rate_pct:.1f}%",
+                        pf_str,
+                        f"+{sm.gross_profit:,.2f} ₽",
+                        f"-{sm.gross_loss:,.2f} ₽",
+                        f"{sm.commissions:,.2f} ₽",
+                        f"[{p_c}]{sm.net_profit:+,.2f} ₽[/{p_c}]"
+                    )
+                console.print(t_type)
+                console.print("\n")
 
     else:
         # Тестирование одиночного тикера
